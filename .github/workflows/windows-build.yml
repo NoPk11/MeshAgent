@@ -1,0 +1,48 @@
+# WikiTech: Windows agent CI build for the wikitech fork.
+# Adapted from upstream Ylianst/MeshAgent .github/workflows/windows-build.yml (added upstream after our
+# pinned commit 62b206e). Builds only the MeshService project (the agent) for x64 / x86 / ARM64.
+# Output is UNSIGNED - signing happens on the WikiTech server (jsign + Azure Trusted Signing).
+# Artifacts here never auto-deploy anywhere; putting a binary in meshcentralwikitech/agents/ is a manual,
+# separate, staged step.
+name: Windows Build
+
+run-name: Build Windows WikiTechRMM agent (unsigned)
+
+on:
+  push:
+    branches: ['wikitech', 'wikitech/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: ${{ matrix.platform == 'ARM64' && 'windows-11-arm' || 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, x86, ARM64]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0   # pre-build event embeds `git log -1` hash/date into the binary
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+    - name: Build ${{ matrix.platform }}
+      run: msbuild MeshAgent-2022.sln -t:MeshService-2022 -p:Configuration=Release -p:Platform=${{ matrix.platform }} -m
+    - name: Report
+      shell: pwsh
+      run: |
+        Get-ChildItem Release\MeshService*.exe | ForEach-Object {
+          "{0}  {1} bytes  sha256 {2}" -f $_.Name, $_.Length, (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+        }
+    - name: Upload ${{ matrix.platform }} artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        if-no-files-found: error
+        name: meshagent-windows-${{ matrix.platform }}
+        path: |
+          Release/MeshService*.exe
+          Release/MeshService*.pdb
