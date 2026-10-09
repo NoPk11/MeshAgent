@@ -758,16 +758,25 @@ function serviceManager()
                             }
                         }
                     });
-                try
-                {
-                    Object.defineProperty(retVal, 'installedDate',
+                Object.defineProperty(retVal, 'installedDate',
+                    {
+                        get: function()
                         {
-                            value: require('win-registry').QueryKeyLastModified(require('win-registry').HKEY.LocalMachine, 'SYSTEM\\CurrentControlSet\\Services\\' + name, 'ImagePath')
-                        });
-                }
-                catch(xx)
-                {
-                }
+                            if (this._installedDate === undefined)
+                            {
+                                var reg = require('win-registry');
+                                try
+                                {
+                                    this._installedDate = reg.QueryKeyLastModified(reg.HKEY.LocalMachine, 'SYSTEM\\CurrentControlSet\\Services\\' + this.name, 'ImagePath');
+                                }
+                                catch(xx)
+                                {
+                                    this._installedDate = null;
+                                }
+                            }
+                            return (this._installedDate);
+                        }
+                    });
                 if (retVal.status.state != 'UNKNOWN')
                 {
                     require('events').EventEmitter.call(retVal);
@@ -2433,11 +2442,11 @@ function serviceManager()
                     reg.WriteKey(reg.HKEY.LocalMachine, 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + options.name, 'NoRepair', 0x1);
                     if (options.name == 'Mesh Agent' || options._installer == true)
                     {
-                        reg.WriteKey(reg.HKEY.LocalMachine, 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + options.name, 'UninstallString', options.servicePath + ' -funinstall --meshServiceName="' + options.name + '"');
+                        reg.WriteKey(reg.HKEY.LocalMachine, 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + options.name, 'UninstallString', '"' + options.servicePath + '" -funinstall --meshServiceName="' + options.name + '"');
                     }
                     else
                     {
-                        reg.WriteKey(reg.HKEY.LocalMachine, 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + options.name, 'UninstallString', options.servicePath + ' -b64exec ' + script);
+                        reg.WriteKey(reg.HKEY.LocalMachine, 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + options.name, 'UninstallString', '"' + options.servicePath + '" -b64exec ' + script);
                     }
                     reg.WriteKey(reg.HKEY.LocalMachine, 'SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\' + options.name, 'DisplayVersion', process.versions.commitDate.toString());
                 }
@@ -2475,6 +2484,8 @@ function serviceManager()
             if (require('fs').existsSync('/usr/sbin/daemon'))
             {
                 // FreeBSD
+                // Ensure /usr/local/etc/rc.d/ exists, as it does not by default on freebsd 15, current version of mkdirSync doesn't support recursive 
+                if (!(require('fs').existsSync('/usr/local/etc/rc.d/'))) { require('fs').mkdirSync('/usr/local/etc/'); require('fs').mkdirSync('/usr/local/etc/rc.d/'); }
                 var rc = require('fs').createWriteStream('/usr/local/etc/rc.d/' + options.name, { flags: 'wb' });
                 rc.write('#!/bin/sh\n');
                 rc.write('# PROVIDE: ' + options.name + '\n');

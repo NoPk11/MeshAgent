@@ -39,6 +39,12 @@ MeshAgentHostContainer *agentHost = NULL;
 char __agentExecPath[1024] = { 0 };
 #endif
 
+#if defined(__APPLE__)
+#include <bsm/audit.h>
+#include <bsm/audit_session.h>
+#include <unistd.h>
+#endif
+
 
 #ifdef WIN32
 BOOL CtrlHandler(DWORD fdwCtrlType)
@@ -139,13 +145,12 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
 
 	if (argc > 2 && strcmp(argv[1], "-exec") == 0 && integratedJavaScriptLen == 0)
 	{
-		integratedJavaScript = ILibString_Copy(argv[2], 0);
-		integratedJavaScriptLen = (int)strnlen_s(integratedJavaScript, sizeof(ILibScratchPad));
+		integratedJavaScriptLen = (int)strlen(argv[2]);
+		integratedJavaScript = ILibString_Copy(argv[2], (size_t)integratedJavaScriptLen);
 	} 
 	if (argc > 2 && strcmp(argv[1], "-b64exec") == 0)
 	{
-		integratedJavaScript = NULL;
-		integratedJavaScriptLen = ILibBase64Decode((unsigned char *)argv[2], (const int)strnlen_s(argv[2], sizeof(ILibScratchPad2)), (unsigned char**)&integratedJavaScript);
+		integratedJavaScriptLen = ILibBase64Decode((unsigned char *)argv[2], (const int)strlen(argv[2]), (unsigned char**)&integratedJavaScript);
 	}
 	if (argc > 1 && strcasecmp(argv[1], "-nodeid") == 0 && integratedJavaScriptLen == 0)
 	{
@@ -277,11 +282,50 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
 #if defined(_LINKVM) && defined(__APPLE__)
 	if (argc > 1 && strcasecmp(argv[1], "-kvm0") == 0)
 	{
+		// Tahoe audit-session join: pre-exec in SpawnProcessEx4 (as
+		// root) is what discovers and joins the user's gui session;
+		// post-exec call here as uid 501 inherits enough visibility
+		// from that to re-join cleanly and ensures the helper's
+		// kernel-tracked asid lands on the user's gui session before
+		// kvm_server_mainloop opens its XPC connection to
+		// com.apple.replayd. Both calls together are needed: the
+		// pre-exec join doesn't survive exec on its own, and
+		// post-exec alone is denied (uid 501 can't audit_session_port
+		// arbitrary asids on Tahoe).
+		extern int ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(uid_t uid);
+		ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(getuid());
 		kvm_server_mainloop(NULL);
 		return 0;
 	}
 	else if (argc > 1 && strcasecmp(argv[1], "-kvm1") == 0)
 	{
+		kvm_server_mainloop((void*)(uint64_t)getpid());
+		return 0;
+	}
+	else if (argc > 1 && strcasecmp(argv[1], "-kvmagent") == 0)
+	{
+		// User-context LaunchAgent mode: long-running KVM server that
+		// listens on a Unix domain socket in the console user's session.
+		// Loaded by launchd into gui/<uid> via a LaunchAgent plist; runs
+		// natively in the user's GUI audit session, so com.apple.replayd
+		// (which only registers in gui/<uid>) is reachable without the
+		// audit_session_join workaround the daemon-spawn path needs.
+		// Daemon connects to this socket when MeshCentral's Desktop tab
+		// opens, instead of fork+exec'ing a -kvm0 helper.
+		// Optional argv[2] = socket path; defaults to a tmp-dir path
+		// keyed by uid so the agent can bind it as a non-root user.
+		extern void kvm_set_listener_path(const char *path);
+		char defaultPath[128];
+		if (argc > 2 && argv[2] != NULL && argv[2][0] != '\0')
+		{
+			kvm_set_listener_path(argv[2]);
+		}
+		else
+		{
+			snprintf(defaultPath, sizeof(defaultPath),
+				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
+			kvm_set_listener_path(defaultPath);
+		}
 		kvm_server_mainloop((void*)(uint64_t)getpid());
 		return 0;
 	}

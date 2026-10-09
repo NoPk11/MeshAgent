@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 #include "linux_kvm.h"
+#include "linux_kvm_wayland.h"
+#include "linux_kvm_drm.h"
 #include "meshcore/meshdefines.h"
 #include "microstack/ILibParsers.h"
 #include "microstack/ILibAsyncSocket.h"
@@ -22,11 +24,15 @@ limitations under the License.
 #include "microstack/ILibProcessPipe.h"
 #include <sys/wait.h>
 #include <limits.h>
+#include <stdint.h>
 #include <time.h>
+#include <pwd.h>
+#include <grp.h>
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrandr.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <dlfcn.h>
@@ -126,14 +132,40 @@ int g_totalRestartCount = 0;
 int g_shutdown = 0;
 int change_display = 0;
 pid_t g_slavekvm = 0;
-int master2slave[2];
-int slave2master[2];
+int master2slave[2] = { -1, -1 };
+int slave2master[2] = { -1, -1 };
+static void *g_kvmChain = NULL;
 char CURRENT_XDISPLAY[256];
 int CURRENT_DISPLAY_ID = -1;
+
+kvm_monitor_info g_monitors[KVM_MAX_MONITORS];
+int g_monitor_count = 0;
+int SCREEN_SEL = 0;         // 0 = all monitors, 1..N = specific physical monitor
+int SCREEN_SEL_TARGET = 0;
+int CAPTURE_X = 0;          // top-left of capture region (0 if all monitors)
+int CAPTURE_Y = 0;
+int VSCREEN_WIDTH = 0;      // full virtual desktop width (all monitors combined)
+int VSCREEN_HEIGHT = 0;
 
 FILE *logFile = NULL;
 int g_enableEvents = 0;
 extern int gRemoteMouseRenderDefault;
+
+// In DRM mode the slave->master pipe is non-blocking and shared with the tile stream, so every
+// sender must go through the draining writer in linux_kvm_drm.c: a raw write() could truncate a
+// message on a full pipe (desyncing the stream) or, blocking, re-arm the master<->slave pipe
+// deadlock that the draining writer exists to prevent.
+static void kvm_slave_send(const void *buffer, size_t len)
+{
+	if (g_kvmBackendDRM != 0)
+	{
+		ignore_result(kvm_drm_slave_write(buffer, len));
+	}
+	else
+	{
+		ignore_result(write(slave2master[1], buffer, len));
+	}
+}
 
 int remoteMouseX = 0, remoteMouseY = 0;
 
@@ -165,6 +197,16 @@ typedef struct xfixes_struct
 }xfixes_struct;
 xfixes_struct *xfixes_exports = NULL;
 xkb_struct *xkb_exports = NULL;
+
+typedef struct xrandr_struct
+{
+	void *xrandr_lib;
+	XRRScreenResources*(*XRRGetScreenResources)(Display *dpy, Window window);
+	void(*XRRFreeScreenResources)(XRRScreenResources *resources);
+	XRRCrtcInfo*(*XRRGetCrtcInfo)(Display *dpy, XRRScreenResources *resources, RRCrtc crtc);
+	void(*XRRFreeCrtcInfo)(XRRCrtcInfo *crtcInfo);
+} xrandr_struct;
+xrandr_struct *xrandr_exports = NULL;
 
 void kvm_keyboard_unmap_unicode_key(Display *display, int keycode)
 {
@@ -272,10 +314,13 @@ void kvm_send_error(char *msg)
 	int msgLen = strnlen_s(msg, 255);
 	char buffer[512];
 
+	// Otherwise this only reaches the MeshCentral viewer, so the error never shows in the agent's own log.
+	fprintf(stderr, "KVM error: %s\n", msg); fflush(stderr);
+
 	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_ERROR);	// Write the type
 	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)(msgLen + 4));	// Write the size
 	memcpy_s(buffer + 4, msgLen, msg, msgLen);
-	ignore_result(write(slave2master[1], buffer, msgLen + 2));
+	kvm_slave_send(buffer, msgLen + 4);
 }
 
 KVM_MouseCursors kvm_fetch_currentCursor(Display *cursordisplay)
@@ -415,17 +460,18 @@ void kvm_send_resolution()
 	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)SCREEN_WIDTH);		// X position
 	((unsigned short*)buffer)[3] = (unsigned short)htons((unsigned short)SCREEN_HEIGHT);	// Y position
 
-	ignore_result(write(slave2master[1], buffer, sizeof(buffer)));
+	kvm_slave_send(buffer, sizeof(buffer));
 }
 
 void kvm_send_display()
 {
-	char buffer[5];
+	char buffer[6];
+	unsigned short sel = (g_monitor_count > 0) ? ((SCREEN_SEL == 0) ? (unsigned short)65535 : (unsigned short)SCREEN_SEL) : (unsigned short)CURRENT_DISPLAY_ID;
 	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_SET_DISPLAY);	// Write the type
-	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
-	buffer[4] = CURRENT_DISPLAY_ID;																// Display number
+	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)6);					// Write the size
+	((unsigned short*)buffer)[2] = (unsigned short)htons(sel);									// Display selection
 
-	ignore_result(write(slave2master[1], buffer, sizeof(buffer)));
+	kvm_slave_send(buffer, sizeof(buffer));
 }
 
 #define BUFSIZE 65535
@@ -444,9 +490,125 @@ int lockfileCheckFn(const struct dirent *ent) {
 	return 0;
 }
 
-void getAvailableDisplays(unsigned short **array, int *len) 
+void kvm_apply_monitor_selection()
+{
+	if (SCREEN_SEL > 0 && (SCREEN_SEL - 1) < g_monitor_count)
+	{
+		int idx = SCREEN_SEL - 1;
+		CAPTURE_X    = g_monitors[idx].x;
+		CAPTURE_Y    = g_monitors[idx].y;
+		SCREEN_WIDTH  = g_monitors[idx].width;
+		SCREEN_HEIGHT = g_monitors[idx].height;
+	}
+	else
+	{
+		SCREEN_SEL   = 0;
+		SCREEN_SEL_TARGET = 0;
+		CAPTURE_X    = 0;
+		CAPTURE_Y    = 0;
+		SCREEN_WIDTH  = VSCREEN_WIDTH;
+		SCREEN_HEIGHT = VSCREEN_HEIGHT;
+	}
+}
+
+void kvm_update_monitor_layout(kvm_monitor_info *monitors, int monitorCount, int virtualWidth, int virtualHeight)
 {
 	int i;
+	if (monitorCount < 0) { monitorCount = 0; }
+	if (monitorCount > KVM_MAX_MONITORS) { monitorCount = KVM_MAX_MONITORS; }
+
+	g_monitor_count = 0;
+	for (i = 0; i < monitorCount; ++i)
+	{
+		if (monitors[i].width <= 0 || monitors[i].height <= 0) { continue; }
+		g_monitors[g_monitor_count] = monitors[i];
+		g_monitors[g_monitor_count].id = g_monitor_count + 1;
+		g_monitor_count++;
+	}
+
+	VSCREEN_WIDTH = virtualWidth;
+	VSCREEN_HEIGHT = virtualHeight;
+	if (g_monitor_count == 0 && (VSCREEN_WIDTH <= 0 || VSCREEN_HEIGHT <= 0))
+	{
+		VSCREEN_WIDTH = SCREEN_WIDTH;
+		VSCREEN_HEIGHT = SCREEN_HEIGHT;
+	}
+
+	kvm_apply_monitor_selection();
+}
+
+// Enumerate physical monitors via XRandR into g_monitors[] and update capture region.
+// Falls back gracefully if XRandR is unavailable.
+static void kvm_enumerate_monitors()
+{
+	g_monitor_count = 0;
+	if (xrandr_exports != NULL && xrandr_exports->XRRGetScreenResources != NULL)
+	{
+		Window root = x11_exports->XRootWindow(eventdisplay, SCREEN_NUM);
+		XRRScreenResources *res = xrandr_exports->XRRGetScreenResources(eventdisplay, root);
+		if (res != NULL)
+		{
+			int mi;
+			for (mi = 0; mi < res->ncrtc && g_monitor_count < KVM_MAX_MONITORS; mi++)
+			{
+				XRRCrtcInfo *ci = xrandr_exports->XRRGetCrtcInfo(eventdisplay, res, res->crtcs[mi]);
+				if (ci != NULL)
+				{
+					if (ci->width > 0 && ci->height > 0)
+					{
+						g_monitors[g_monitor_count].id     = g_monitor_count + 1;
+						g_monitors[g_monitor_count].x      = ci->x;
+						g_monitors[g_monitor_count].y      = ci->y;
+						g_monitors[g_monitor_count].width  = (int)ci->width;
+						g_monitors[g_monitor_count].height = (int)ci->height;
+						g_monitor_count++;
+					}
+					xrandr_exports->XRRFreeCrtcInfo(ci);
+				}
+			}
+			xrandr_exports->XRRFreeScreenResources(res);
+		}
+	}
+	kvm_apply_monitor_selection();
+}
+
+// Send MNG_KVM_DISPLAY_INFO: per-monitor geometry (ID, X, Y, W, H) matching Windows format.
+void kvm_send_display_info()
+{
+	int i;
+	int totalSize;
+	char *buffer;
+	if (g_monitor_count == 0) { return; }
+	totalSize = 4 + (g_monitor_count * 10); // 4-byte header + 10 bytes (5 shorts) per monitor
+	buffer = (char*)ILibMemory_SmartAllocate(totalSize);
+	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_DISPLAY_INFO);
+	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)totalSize);
+	for (i = 0; i < g_monitor_count; i++)
+	{
+		int base = 2 + (i * 5); // index into unsigned short array
+		((unsigned short*)buffer)[base + 0] = (unsigned short)htons((unsigned short)g_monitors[i].id);
+		((unsigned short*)buffer)[base + 1] = (unsigned short)htons((unsigned short)g_monitors[i].x);
+		((unsigned short*)buffer)[base + 2] = (unsigned short)htons((unsigned short)g_monitors[i].y);
+		((unsigned short*)buffer)[base + 3] = (unsigned short)htons((unsigned short)g_monitors[i].width);
+		((unsigned short*)buffer)[base + 4] = (unsigned short)htons((unsigned short)g_monitors[i].height);
+	}
+	kvm_slave_send(buffer, ILibMemory_Size(buffer));
+	ILibMemory_Free(buffer);
+}
+
+void getAvailableDisplays(unsigned short **array, int *len)
+{
+	int i;
+	if (g_monitor_count > 0)
+	{
+		// XRandR mode: expose 65535 ("all") + 1-based physical monitor IDs
+		*len = g_monitor_count + 1;
+		if ((*array = (unsigned short *)malloc((*len) * sizeof(unsigned short))) == NULL) ILIBCRITICALEXIT(254);
+		(*array)[0] = (unsigned short)65535; // "all monitors"
+		for (i = 0; i < g_monitor_count; i++) { (*array)[i + 1] = (unsigned short)g_monitors[i].id; }
+		return;
+	}
+	// Legacy: X11 logical screens (usually just one)
 	*len = x11_exports->XScreenCount(eventdisplay);
 	if ((*array = (unsigned short *)malloc((*len) * sizeof(unsigned short))) == NULL) ILIBCRITICALEXIT(254);
 	for (i = 0; i < (*len); ++i)
@@ -462,21 +624,30 @@ void kvm_send_display_list()
 	char* buffer;
 	int totalSize = 0;
 	int i;
+	unsigned short currentSel;
+
+	kvm_send_display_info(); // Send per-monitor geometry (MNG_KVM_DISPLAY_INFO) first
 
 	getAvailableDisplays(&displays, &len);
-	totalSize = 2 /*Type*/ + 2 /*length of packet*/ + 2 /*length of data*/ + (len * 2) /*Data*/ + 2 /* Current display */;
+	totalSize = 2 /*Type*/ + 2 /*length of packet*/ + 2 /*count*/ + (len * 2) /*IDs*/ + 2 /* Current display */;
 	buffer = (char*)ILibMemory_SmartAllocate(totalSize);
 
 	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);	// Write the type
 	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)totalSize);			// Write the size
-	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)len);					// Length
-	for (i = 0; i < len; i++) 
+	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)len);					// Count
+	for (i = 0; i < len; i++)
 	{
 		((unsigned short*)buffer)[i + 3] = (unsigned short)htons(displays[i]);
 	}
-	((unsigned short*)buffer)[i + 3] = (unsigned short)htons((unsigned short)CURRENT_DISPLAY_ID);	// Current display
+	// Current selection: 65535 = all monitors, 1..N = specific monitor (matches Windows convention)
+	if (g_monitor_count > 0)
+		currentSel = (SCREEN_SEL == 0) ? (unsigned short)65535 : (unsigned short)SCREEN_SEL;
+	else
+		currentSel = (unsigned short)CURRENT_DISPLAY_ID;
+	((unsigned short*)buffer)[i + 3] = (unsigned short)htons(currentSel);
 
-	ignore_result(write(slave2master[1], buffer, ILibMemory_Size(buffer)));
+	kvm_slave_send(buffer, ILibMemory_Size(buffer));
+	free(displays);
 }
 
 char Location_X11LIB[NAME_MAX];
@@ -484,13 +655,15 @@ char Location_X11TST[NAME_MAX];
 char Location_X11EXT[NAME_MAX];
 char Location_X11FIXES[NAME_MAX];
 char Location_X11KB[NAME_MAX];
+char Location_X11RANDR[NAME_MAX];
 void kvm_set_x11_locations(char *libx11, char *libx11tst, char *libx11ext, char *libxfixes, char *libx11kb)
 {
 	if (libx11 != NULL) { strcpy_s(Location_X11LIB, sizeof(Location_X11LIB), libx11); } else { strcpy_s(Location_X11LIB, sizeof(Location_X11LIB), "libX11.so"); }
 	if (libx11tst != NULL) { strcpy_s(Location_X11TST, sizeof(Location_X11TST), libx11tst); } else { strcpy_s(Location_X11TST, sizeof(Location_X11TST), "libXtst.so"); }
-	if (libx11ext != NULL) { strcpy_s(Location_X11EXT, sizeof(Location_X11EXT), libx11ext); } else { strcpy_s(Location_X11EXT, sizeof(Location_X11EXT), "libXext.so"); }		
+	if (libx11ext != NULL) { strcpy_s(Location_X11EXT, sizeof(Location_X11EXT), libx11ext); } else { strcpy_s(Location_X11EXT, sizeof(Location_X11EXT), "libXext.so"); }
 	if (libxfixes != NULL) { strcpy_s(Location_X11FIXES, sizeof(Location_X11FIXES), libxfixes); } else { strcpy_s(Location_X11FIXES, sizeof(Location_X11FIXES), "libXfixes.so"); }
 	if (libx11kb != NULL) { strcpy_s(Location_X11KB, sizeof(Location_X11KB), libx11kb); } else { strcpy_s(Location_X11KB, sizeof(Location_X11KB), "libxkbfile.so"); }
+	strcpy_s(Location_X11RANDR, sizeof(Location_X11RANDR), "libXrandr.so");
 }
 
 int kvm_init(int displayNo)
@@ -581,7 +754,21 @@ int kvm_init(int displayNo)
 			((void**)xkb_exports)[4] = (void*)dlsym(xkb_exports->xkb_lib, "XkbSelectEvents");
 		}
 	}
-
+	if (xrandr_exports == NULL)
+	{
+		xrandr_exports = ILibMemory_SmartAllocate(sizeof(xrandr_struct));
+		// Try unversioned name first (needs libxrandr-dev), then fall back to versioned runtime lib
+		xrandr_exports->xrandr_lib = dlopen(Location_X11RANDR, RTLD_NOW);
+		if (xrandr_exports->xrandr_lib == NULL) { xrandr_exports->xrandr_lib = dlopen("libXrandr.so.2", RTLD_NOW); }
+		if (xrandr_exports->xrandr_lib == NULL) { xrandr_exports->xrandr_lib = dlopen("libXrandr.so.2.2.0", RTLD_NOW); }
+		if (xrandr_exports->xrandr_lib)
+		{
+			((void**)xrandr_exports)[1] = (void*)dlsym(xrandr_exports->xrandr_lib, "XRRGetScreenResources");
+			((void**)xrandr_exports)[2] = (void*)dlsym(xrandr_exports->xrandr_lib, "XRRFreeScreenResources");
+			((void**)xrandr_exports)[3] = (void*)dlsym(xrandr_exports->xrandr_lib, "XRRGetCrtcInfo");
+			((void**)xrandr_exports)[4] = (void*)dlsym(xrandr_exports->xrandr_lib, "XRRFreeCrtcInfo");
+		}
+	}
 
 	sprintf_s(CURRENT_XDISPLAY, sizeof(CURRENT_XDISPLAY), ":%d", (int)displayNo);
 
@@ -602,14 +789,17 @@ int kvm_init(int displayNo)
 	if (!g_enableEvents) { printf("FATAL::::Fake motion is not supported.\n\n\n"); }
 
 	CURRENT_DISPLAY_ID = SCREEN_NUM = DefaultScreen(eventdisplay);
-	SCREEN_HEIGHT = DisplayHeight(eventdisplay, SCREEN_NUM);
-	SCREEN_WIDTH = DisplayWidth(eventdisplay, SCREEN_NUM);
-	SCREEN_DEPTH = DefaultDepth(eventdisplay, SCREEN_NUM);
+	VSCREEN_WIDTH  = DisplayWidth(eventdisplay, SCREEN_NUM);
+	VSCREEN_HEIGHT = DisplayHeight(eventdisplay, SCREEN_NUM);
+	SCREEN_DEPTH   = DefaultDepth(eventdisplay, SCREEN_NUM);
 
 	if (SCREEN_DEPTH < 15) {
 		// fprintf(stderr, "kvm_init: We do not support display depth < 15.");
 		return -1;
 	}
+
+	// Enumerate physical monitors and set SCREEN_WIDTH/HEIGHT/CAPTURE_X/Y
+	kvm_enumerate_monitors();
 
 	// Some magic numbers.
 	TILE_WIDTH = 32;
@@ -648,27 +838,56 @@ int kvm_init(int displayNo)
 
 void CheckDesktopSwitch(int checkres)
 {
-	if (change_display) 
+	UNREFERENCED_PARAMETER(checkres);
+	if (g_kvmBackendDRM != 0) { return; }
+
+	if (change_display)
 	{
-		if (logFile) { fprintf(logFile, "kvm_init(%d) checkDesktopSwitch\n", CURRENT_DISPLAY_ID);  fflush(logFile); }
+		if (logFile) { fprintf(logFile, "CheckDesktopSwitch: SCREEN_SEL_TARGET=%d CURRENT_DISPLAY_ID=%d\n", SCREEN_SEL_TARGET, CURRENT_DISPLAY_ID); fflush(logFile); }
 		int old_height_count = TILE_HEIGHT_COUNT;
 		change_display = 0;
-		
-		SCREEN_NUM = CURRENT_DISPLAY_ID;
-		SCREEN_HEIGHT = DisplayHeight(eventdisplay, CURRENT_DISPLAY_ID);
-		SCREEN_WIDTH = DisplayWidth(eventdisplay, CURRENT_DISPLAY_ID);
-		SCREEN_DEPTH = DefaultDepth(eventdisplay, CURRENT_DISPLAY_ID);
+
+		if (g_monitor_count > 0)
+		{
+			// XRandR mode: switch physical monitor selection
+			SCREEN_SEL = SCREEN_SEL_TARGET;
+			if (SCREEN_SEL > 0 && (SCREEN_SEL - 1) < g_monitor_count)
+			{
+				int idx = SCREEN_SEL - 1;
+				CAPTURE_X    = g_monitors[idx].x;
+				CAPTURE_Y    = g_monitors[idx].y;
+				SCREEN_WIDTH  = g_monitors[idx].width;
+				SCREEN_HEIGHT = g_monitors[idx].height;
+			}
+			else
+			{
+				SCREEN_SEL   = 0;
+				CAPTURE_X    = 0;
+				CAPTURE_Y    = 0;
+				SCREEN_WIDTH  = VSCREEN_WIDTH;
+				SCREEN_HEIGHT = VSCREEN_HEIGHT;
+			}
+		}
+		else
+		{
+			// Legacy: switch X11 logical screen
+			SCREEN_NUM    = CURRENT_DISPLAY_ID;
+			SCREEN_HEIGHT = DisplayHeight(eventdisplay, CURRENT_DISPLAY_ID);
+			SCREEN_WIDTH  = DisplayWidth(eventdisplay, CURRENT_DISPLAY_ID);
+			SCREEN_DEPTH  = DefaultDepth(eventdisplay, CURRENT_DISPLAY_ID);
+			CAPTURE_X     = 0;
+			CAPTURE_Y     = 0;
+		}
 
 		TILE_HEIGHT_COUNT = SCREEN_HEIGHT / TILE_HEIGHT;
-		TILE_WIDTH_COUNT = SCREEN_WIDTH / TILE_WIDTH;
-		if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
+		TILE_WIDTH_COUNT  = SCREEN_WIDTH  / TILE_WIDTH;
+		if (SCREEN_WIDTH  % TILE_WIDTH)  { TILE_WIDTH_COUNT++; }
 		if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
 
 		kvm_send_resolution();
 		kvm_send_display();
-
+		kvm_send_display_list(); // re-send list with updated current selection so the UI highlights the right icon
 		reset_tile_info(old_height_count);
-		return;
 	}
 }
 
@@ -679,8 +898,8 @@ int kvm_server_inputdata(char* block, int blocklen)
 
 	// Decode the block header
 	if (blocklen < 4) return 0;
-	type = ntohs(((unsigned short*)(block))[0]);
-	size = ntohs(((unsigned short*)(block))[1]);
+	type = ntohs(ILibUnaligned_Read16(block));
+	size = ntohs(ILibUnaligned_Read16(block + 2));
 	if (size > blocklen) return 0;
 
 	switch (type)
@@ -708,9 +927,10 @@ int kvm_server_inputdata(char* block, int blocklen)
 			short w = 0;
 			if (size == 10 || size == 12)
 			{
-				x = ((int)ntohs(((unsigned short*)(block))[3]));
-				y = ((int)ntohs(((unsigned short*)(block))[4]));
-				if (size == 12) w = ((short)ntohs(((short*)(block))[5]));
+				// Client sends coords relative to the captured region; translate to absolute screen coords
+				x = ((int)ntohs(ILibUnaligned_Read16(block + 6))) + CAPTURE_X;
+				y = ((int)ntohs(ILibUnaligned_Read16(block + 8))) + CAPTURE_Y;
+				if (size == 12) w = ((short)ntohs(ILibUnaligned_Read16(block + 10)));
 				if (logFile) { fprintf(logFile, "RemoteMouseMove: (%d, %d)\n", x, y); }
 				// printf("x:%d, y:%d, b:%d, w:%d\n", x, y, block[5], w);
 				if (g_enableEvents)
@@ -723,8 +943,8 @@ int kvm_server_inputdata(char* block, int blocklen)
 		}
 	case MNG_KVM_COMPRESSION: // Compression
 		{
-			if (size >= 10) { int fr = ((int)ntohs(((unsigned short*)(block + 8))[0])); if (fr >= 20 && fr <= 5000) FRAME_RATE_TIMER = fr; }
-			if (size >= 8) { int ns = ((int)ntohs(((unsigned short*)(block + 6))[0])); if (ns >= 64 && ns <= 4096) SCALING_FACTOR_NEW = ns; }
+			if (size >= 10) { int fr = ((int)ntohs(ILibUnaligned_Read16(block + 8))); if (fr >= 20 && fr <= 5000) FRAME_RATE_TIMER = fr; }
+			if (size >= 8) { int ns = ((int)ntohs(ILibUnaligned_Read16(block + 6))); if (ns >= 64 && ns <= 4096) SCALING_FACTOR_NEW = ns; }
 			if (size >= 6) { set_tile_compression((int)block[4], (int)block[5]); }
 			COMPRESSION_RATIO = 100;
 			break;
@@ -757,7 +977,7 @@ int kvm_server_inputdata(char* block, int blocklen)
 		}
 	case MNG_KVM_FRAME_RATE_TIMER:
 		{
-			int fr = ((int)ntohs(((unsigned short*)(block))[2]));
+			int fr = ((int)ntohs(ILibUnaligned_Read16(block + 4)));
 			if (fr >= 20 && fr <= 5000) FRAME_RATE_TIMER = fr;
 			break;
 		}
@@ -768,9 +988,23 @@ int kvm_server_inputdata(char* block, int blocklen)
 		}
 	case MNG_KVM_SET_DISPLAY:
 		{
-			if (ntohs(((unsigned short*)(block))[2]) == CURRENT_DISPLAY_ID) { break; } // Don't do anything
-			CURRENT_DISPLAY_ID = ntohs(((unsigned short*)(block))[2]);
-			change_display = 1;
+			unsigned short newval = ntohs(ILibUnaligned_Read16(block + 4));
+			if (g_monitor_count > 0)
+			{
+				// XRandR mode: 65535 = all monitors, 1..N = specific physical monitor
+				int newsel = (newval == 65535) ? 0 : (int)newval;
+				if (newsel == SCREEN_SEL_TARGET) { break; }
+				SCREEN_SEL_TARGET = newsel;
+				change_display = 1;
+			}
+			else
+			{
+				// Legacy X11 screen mode
+				if ((int)newval == CURRENT_DISPLAY_ID) { break; }
+				CURRENT_DISPLAY_ID = (int)newval;
+				SCREEN_SEL_TARGET  = 0;
+				change_display = 1;
+			}
 			break;
 		}
 	}
@@ -781,6 +1015,7 @@ int kvm_server_inputdata(char* block, int blocklen)
 int kvm_relay_feeddata(char* buf, int len)
 {
 	ssize_t written = 0;
+	if (g_slavekvm <= 0 || master2slave[1] < 0) { return 0; }
 
 	// Write the reply to the pipe.
 	//fprintf(logFile, "Writing to slave in kvm_relay_feeddata\n");
@@ -811,7 +1046,7 @@ void kvm_server_jpegerror(char *msg)
 	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)(msgLen + 4));	// Write the size
 	memcpy_s(buffer + 4, msgLen, msg, msgLen);
 
-	ignore_result(write(slave2master[1], buffer, ILibMemory_Size(buffer)));
+	kvm_slave_send(buffer, ILibMemory_Size(buffer));
 }
 
 #pragma pack(push, 1)
@@ -948,8 +1183,10 @@ void kvm_server_sighandler(int signum, siginfo_t *info, void *context)
 {
 	g_shutdown = 1;
 }
-void* kvm_server_mainloop(void* parm)
+
+void* kvm_server_mainloop_x11(void* parm)
 {
+	int sessionUid = (int)(intptr_t)parm;
 	int maxsleep;
 	Window rr, cr;
 	int rx, ry, wx, wy, rs;
@@ -979,6 +1216,24 @@ void* kvm_server_mainloop(void* parm)
 	XEvent XE;
 
 	unsigned short currentDisplayId = 0;
+
+	if (sessionUid != 0)
+	{
+		// Full drop, not bare setuid: keeping gid 0 / root's supplementary groups would leave the
+		// X11 slave more privileged than the session user, and continuing as root after a failed
+		// setuid (EAGAIN under RLIMIT_NPROC) must not happen. The DRM path does the same in
+		// kvm_drm_drop_to_session_uid_with_caps().
+		struct passwd *pw = getpwuid((uid_t)sessionUid);
+		if (pw == NULL ||
+			initgroups(pw->pw_name, pw->pw_gid) != 0 ||
+			setgid(pw->pw_gid) != 0 ||
+			setuid((uid_t)sessionUid) != 0)
+		{
+			fprintf(stderr, "KVM: privilege drop to uid %d failed (errno=%d); aborting capture child\n", sessionUid, errno);
+			kvm_send_error("KVM privilege drop failed");
+			return (void *)-1;
+		}
+	}
 
 	if (logFile) { fprintf(logFile, "Checking $DISPLAY\n"); fflush(logFile); }
 	for (char **env = environ; *env; ++env)
@@ -1039,22 +1294,26 @@ void* kvm_server_mainloop(void* parm)
 		imagedisplay = x11_exports->XOpenDisplay(CURRENT_XDISPLAY);
 		if (imagedisplay == NULL) { g_shutdown = 1; break; }
 
-		if (DisplayWidth(imagedisplay, CURRENT_DISPLAY_ID) != SCREEN_WIDTH ||
-			DisplayHeight(imagedisplay, CURRENT_DISPLAY_ID) != SCREEN_HEIGHT ||
+		if (DisplayWidth(imagedisplay, CURRENT_DISPLAY_ID) != VSCREEN_WIDTH ||
+			DisplayHeight(imagedisplay, CURRENT_DISPLAY_ID) != VSCREEN_HEIGHT ||
 			DefaultDepth(eventdisplay, CURRENT_DISPLAY_ID) != SCREEN_DEPTH)
 		{
 			int old = TILE_HEIGHT_COUNT;
-			SCREEN_HEIGHT = DisplayHeight(imagedisplay, CURRENT_DISPLAY_ID);
-			SCREEN_WIDTH = DisplayWidth(imagedisplay, CURRENT_DISPLAY_ID);
-			SCREEN_DEPTH = DefaultDepth(imagedisplay, CURRENT_DISPLAY_ID);
-			if (logFile) { fprintf(logFile, "SLAVE/KVM Resolution Changed: %d x %d x %d bpp\n", SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_DEPTH); fflush(logFile); }
+			VSCREEN_WIDTH  = DisplayWidth(imagedisplay, CURRENT_DISPLAY_ID);
+			VSCREEN_HEIGHT = DisplayHeight(imagedisplay, CURRENT_DISPLAY_ID);
+			SCREEN_DEPTH   = DefaultDepth(imagedisplay, CURRENT_DISPLAY_ID);
+			if (logFile) { fprintf(logFile, "SLAVE/KVM Virtual Screen Changed: %d x %d x %d bpp\n", VSCREEN_WIDTH, VSCREEN_HEIGHT, SCREEN_DEPTH); fflush(logFile); }
+
+			// Re-enumerate physical monitors and update capture region
+			kvm_enumerate_monitors();
 
 			TILE_HEIGHT_COUNT = SCREEN_HEIGHT / TILE_HEIGHT;
-			TILE_WIDTH_COUNT = SCREEN_WIDTH / TILE_WIDTH;
-			if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
+			TILE_WIDTH_COUNT  = SCREEN_WIDTH  / TILE_WIDTH;
+			if (SCREEN_WIDTH  % TILE_WIDTH)  { TILE_WIDTH_COUNT++; }
 			if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
 
 			kvm_send_resolution();
+			kvm_send_display_list();
 			reset_tile_info(old);
 		}
 
@@ -1207,8 +1466,8 @@ void* kvm_server_mainloop(void* parm)
 		x11ext_exports->XShmGetImage(imagedisplay,
 			RootWindowOfScreen(ScreenOfDisplay(imagedisplay, CURRENT_DISPLAY_ID)),
 			image,
-			0,
-			0,
+			CAPTURE_X,
+			CAPTURE_Y,
 			AllPlanes);
 
 		//image = XGetImage(imagedisplay,
@@ -1232,16 +1491,21 @@ void* kvm_server_mainloop(void* parm)
 					unsigned short h = ((unsigned short*)(cimage + 6))[0];
 					unsigned short xhot = ((unsigned short*)(cimage + 8))[0];
 					unsigned short yhot = ((unsigned short*)(cimage + 10))[0];
-					unsigned short mx = rx - xhot, my = ry - yhot;
+					// Translate absolute cursor pos to capture-region-relative coordinates
+					int localRx = rx - CAPTURE_X;
+					int localRy = ry - CAPTURE_Y;
+					unsigned short mx = (localRx > (int)xhot) ? (unsigned short)(localRx - xhot) : 0;
+					unsigned short my = (localRy > (int)yhot) ? (unsigned short)(localRy - yhot) : 0;
 					char *pixels = cimage + (sizeof(void*) == 8 ? 24 : 16);
 
-					//if (logFile) { fprintf(logFile, "BBP: %d, pad: %d, unit: %d, BPP: %d, F: %d, XO: %d: PW: %d\n", image->bytes_per_line, image->bitmap_pad, image->bitmap_unit, image->bits_per_pixel, image->format, image->xoffset, (adjust_screen_size(SCREEN_WIDTH) - image->width) * 3); fflush(logFile); }
-					//if (logFile) { fprintf(logFile, "[%d/ %d x %d] (%d, %d) => (%d, %d | %u, %u)\n", image->bits_per_pixel, xa.width, xa.height, screen_width, screen_height, rx, ry,w , h); fflush(logFile); }
+					if ((mx + w) > (unsigned short)SCREEN_WIDTH)  { mx = (unsigned short)(SCREEN_WIDTH  - w); }
+					if ((my + h) > (unsigned short)SCREEN_HEIGHT) { my = (unsigned short)(SCREEN_HEIGHT - h); }
 
-					if (xhot > rx) { mx = 0; } else if ((mx + w) > SCREEN_WIDTH) { mx = SCREEN_WIDTH - w; }
-					if (yhot > ry) { my = 0; } else if ((my + h) > SCREEN_HEIGHT) { my = SCREEN_HEIGHT - h; }
-
-					bitblt(pixels, (int)w, (int)h, 0, 0, (int)w, (int)h, image->data, SCREEN_WIDTH, SCREEN_HEIGHT, mx, my, 1);
+					// Only render cursor if it is within the current capture region
+					if (localRx >= 0 && localRx < SCREEN_WIDTH && localRy >= 0 && localRy < SCREEN_HEIGHT)
+					{
+						bitblt(pixels, (int)w, (int)h, 0, 0, (int)w, (int)h, image->data, SCREEN_WIDTH, SCREEN_HEIGHT, mx, my, 1);
+					}
 
 					if (sentHideCursor == 0)
 					{
@@ -1357,6 +1621,18 @@ void* kvm_server_mainloop(void* parm)
 	return (void*)0;
 }
 
+void* kvm_server_mainloop(void* parm)
+{
+	int sessionUid = (int)(intptr_t)parm;
+	kvm_screenreader_mode_t screenreaderMode = kvm_screenreader_mode_for_uid(sessionUid);
+	if (screenreaderMode == KVM_SCREENREADER_MODE_DRM)
+	{
+		if (logFile) { fprintf(logFile, "Using DRM KVM backend\n"); fflush(logFile); }
+		return kvm_server_mainloop_drm(parm);
+	}
+	return kvm_server_mainloop_x11(parm);
+}
+
 void kvm_relay_readSink(ILibProcessPipe_Pipe sender, char *buffer, size_t bufferLen, size_t* bytesConsumed)
 {
 	ILibKVM_WriteHandler writeHandler = (ILibKVM_WriteHandler)((void**)ILibMemory_Extra(sender))[0];
@@ -1365,13 +1641,13 @@ void kvm_relay_readSink(ILibProcessPipe_Pipe sender, char *buffer, size_t buffer
 
 	if (bufferLen > 4)
 	{
-		if (ntohs(((unsigned short*)(buffer))[0]) == (unsigned short)MNG_JUMBO)
+		if (ntohs(ILibUnaligned_Read16(buffer)) == (unsigned short)MNG_JUMBO)
 		{
 			if (bufferLen > 8)
 			{
-				if (bufferLen >= (8 + (int)ntohl(((unsigned int*)(buffer))[1])))
+				if (bufferLen >= (8 + (int)ntohl(ILibUnaligned_Read32(buffer + 4))))
 				{
-					*bytesConsumed = 8 + (int)ntohl(((unsigned int*)(buffer))[1]);
+					*bytesConsumed = 8 + (int)ntohl(ILibUnaligned_Read32(buffer + 4));
 					writeHandler(buffer, *bytesConsumed, reserved);
 					return;
 				}
@@ -1379,7 +1655,7 @@ void kvm_relay_readSink(ILibProcessPipe_Pipe sender, char *buffer, size_t buffer
 		}
 		else
 		{
-			size = ntohs(((unsigned short*)(buffer))[1]);
+			size = ntohs(ILibUnaligned_Read16(buffer + 2));
 			if (size <= bufferLen)
 			{
 				*bytesConsumed = size;
@@ -1394,8 +1670,119 @@ void kvm_relay_readSink(ILibProcessPipe_Pipe sender, char *buffer, size_t buffer
 
 #include "../../../microstack/ILibParsers.h"
 
+// --- KVM capture auto-recovery (session handover) -----------------------------------------------
+// When a capture child exits unexpectedly (logout / user-switch / crash) the child's pipe breaks and
+// kvm_relay_brokenPipeSink() runs (a deliberate viewer teardown clears this handler to NULL first, so
+// it never runs then). Instead of only telling the viewer the child died, we ask the agent to
+// re-derive the CURRENT console session uid and re-fork. Rate-limited so a genuinely unrecoverable
+// child cannot storm-fork.
+#define KVM_AUTORECOVER_DELAY_MS   1500		// let the session settle before re-deriving the uid
+#define KVM_AUTORECOVER_MAX_BURST  5		// consecutive quick re-forks before we give up
+#define KVM_AUTORECOVER_RESET_MS   30000	// a child that ran at least this long was healthy: reset the burst
+#define KVM_FORK_RETRY_DELAY_MS     2000
+#define KVM_FORK_RETRY_MAX          10
+
+static uint64_t g_lastKvmForkMs = 0;		// monotonic ms when the current child was forked
+static int g_kvmForkRetryCount = 0;
+static int g_kvmForkRetryDispatch = 0;
+
+// Implemented in agentcore.c: re-derive consoleUid()/X env and re-fork the capture child (reuses the
+// same path as a live user-sessions 'changed' event).
+extern void ILibDuktape_MeshAgent_RemoteDesktop_KvmAutoRecover(void *reservedPtrs);
+
+static uint64_t kvm_relay_now_ms(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) { return 0; }
+	return (((uint64_t)ts.tv_sec) * 1000ULL) + (((uint64_t)ts.tv_nsec) / 1000000ULL);
+}
+
+typedef struct kvm_child_reaper
+{
+	void *chain;
+	pid_t pid;
+	uint64_t killDeadline;
+} kvm_child_reaper;
+
+static void kvm_relay_reap_shutdown(void *object)
+{
+	kvm_child_reaper *child = (kvm_child_reaper*)object;
+	kill(child->pid, SIGKILL);
+	while (waitpid(child->pid, NULL, 0) < 0 && errno == EINTR) {}
+	free(child);
+}
+
+static void kvm_relay_reap(void *object)
+{
+	kvm_child_reaper *child = (kvm_child_reaper*)object;
+	pid_t result = waitpid(child->pid, NULL, WNOHANG);
+	if (result == 0 || (result < 0 && errno == EINTR))
+	{
+		// EOF can arrive before exit; a stuck capture must not block the agent chain.
+		if (kvm_relay_now_ms() >= child->killDeadline)
+		{
+			kill(child->pid, SIGKILL);
+			child->killDeadline = UINT64_MAX;
+		}
+		ILibLifeTime_AddEx(ILibGetBaseTimer(child->chain), child, 100, kvm_relay_reap, kvm_relay_reap_shutdown);
+		return;
+	}
+	free(child);
+}
+
+static void kvm_relay_stop_child(int signalNumber)
+{
+	if (master2slave[1] >= 0) { close(master2slave[1]); master2slave[1] = -1; }
+	if (g_slavekvm > 0)
+	{
+		kvm_child_reaper *child = (kvm_child_reaper*)malloc(sizeof(kvm_child_reaper));
+		if (child == NULL) { ILIBCRITICALEXIT(254); }
+		child->chain = g_kvmChain;
+		child->pid = g_slavekvm;
+		child->killDeadline = kvm_relay_now_ms() + 1000;
+		g_slavekvm = 0;
+		if (signalNumber != 0) { kill(child->pid, signalNumber); }
+		if (child->chain == NULL || ILibIsChainBeingDestroyed(child->chain)) { kvm_relay_reap_shutdown(child); }
+		else { kvm_relay_reap(child); }
+	}
+}
+
+// Decide whether an unexpected child exit should trigger an automatic re-fork. Reuses g_restartcount
+// as a burst gate, cleared whenever the previous child ran long enough to be considered healthy.
+static int kvm_relay_should_autorecover(void)
+{
+	uint64_t now = kvm_relay_now_ms();
+	if (g_lastKvmForkMs != 0 && (now - g_lastKvmForkMs) >= KVM_AUTORECOVER_RESET_MS)
+	{
+		g_restartcount = 0;
+	}
+	if (g_restartcount >= KVM_AUTORECOVER_MAX_BURST) { return 0; }	// give up; fall back to the viewer notice
+	g_restartcount++;
+	g_totalRestartCount++;
+	return 1;
+}
+
+// Deferred off the broken-pipe callback (so we don't re-enter pipe teardown) to perform the recovery.
+static void kvm_relay_autoRecoverSink(void *sender)
+{
+	if (!ILibMemory_CanaryOK(sender)) { return; }	// pipe freed (deliberate teardown) before the timer fired
+	if (g_shutdown || g_slavekvm != 0) { return; }	// shutting down, or a child is already running again
+	ILibDuktape_MeshAgent_RemoteDesktop_KvmAutoRecover(((void**)ILibMemory_Extra(sender))[1]);
+}
+
+static void kvm_relay_forkRetrySink(void *sender)
+{
+	void *reserved;
+	if (!ILibMemory_CanaryOK(sender)) { return; }
+	reserved = ((void**)ILibMemory_Extra(sender))[1];
+	g_kvmForkRetryDispatch = 1;
+	ILibDuktape_MeshAgent_RemoteDesktop_KvmAutoRecover(reserved);
+	g_kvmForkRetryDispatch = 0;
+}
+
 void kvm_relay_brokenPipeSink_2(void *sender)
 {
+	if (!ILibMemory_CanaryOK(sender)) { return; } // pipe was freed before this 4s timer fired
 	ILibKVM_WriteHandler writeHandler = (ILibKVM_WriteHandler)((void**)ILibMemory_Extra(sender))[0];
 	void *reserved = ((void**)ILibMemory_Extra(sender))[1];
 	char msg[] = "KVM Child process has unexpectedly exited";
@@ -1410,32 +1797,36 @@ void kvm_relay_brokenPipeSink_2(void *sender)
 void kvm_relay_brokenPipeSink(ILibProcessPipe_Pipe sender)
 {
 	void *chain = ((void**)ILibMemory_Extra(sender))[2];
+	kvm_relay_stop_child(0);
 
-	if (g_slavekvm != 0)
+	// The child exited without a deliberate teardown (teardown clears this handler first). Try to
+	// auto-recover the session (logout / user-switch) rather than just reporting the child death.
+	// Gated by g_shutdown and a burst limit so an unrecoverable child can't fork-storm; on giving up
+	// we fall through to the original "child unexpectedly exited" viewer notice.
+	if (!g_shutdown && kvm_relay_should_autorecover())
 	{
-		int r;
-		waitpid(g_slavekvm, &r, WNOHANG);
-		g_slavekvm = 0;
+		ILibLifeTime_AddEx(ILibGetBaseTimer(chain), sender, KVM_AUTORECOVER_DELAY_MS, kvm_relay_autoRecoverSink, NULL);
+		return;
 	}
 
-	ILibLifeTime_AddEx(ILibGetBaseTimer(chain), sender, 4000, kvm_relay_brokenPipeSink_2, NULL);	
+	ILibLifeTime_AddEx(ILibGetBaseTimer(chain), sender, 4000, kvm_relay_brokenPipeSink_2, NULL);
 }
 
 void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler writeHandler, void *reserved, int uid, char* authToken, char *dispid)
 {
-	int r;
-	int count = 0;
 	ILibProcessPipe_Pipe slave_out;
 
-	if (g_slavekvm != 0) 
-	{
-		kill(g_slavekvm, SIGKILL);
-		waitpid(g_slavekvm, &r, 0);
-		g_slavekvm = 0;
-	}
+	g_kvmChain = ((ILibChain_Link*)processPipeMgr)->ParentChain;
+	if (paused != 0 || !g_kvmForkRetryDispatch) { g_kvmForkRetryCount = 0; }
+	kvm_relay_stop_child(SIGKILL);
 
-	r = pipe(slave2master);
-	r = pipe(master2slave);
+	if (pipe(slave2master) != 0) { return NULL; }
+	if (pipe(master2slave) != 0)
+	{
+		close(slave2master[0]); close(slave2master[1]);
+		slave2master[0] = slave2master[1] = -1;
+		return NULL;
+	}
 
 	// Two Phase is ok here, because all our fork/vfork calls always happen on the same thread
 	fcntl(slave2master[0], F_SETFD, FD_CLOEXEC);
@@ -1448,14 +1839,22 @@ void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler w
 	((void**)ILibMemory_Extra(slave_out))[1] = reserved;
 	((void**)ILibMemory_Extra(slave_out))[2] = ((ILibChain_Link*)processPipeMgr)->ParentChain;
 
-	UNREFERENCED_PARAMETER(r);
-	do
+	g_slavekvm = fork();
+	if (g_slavekvm < 0)
 	{
-		g_slavekvm = fork();
-		if (g_slavekvm == -1 && paused == 0) sleep(2); // If we can't launch the child process, retry in a little while.
+		close(slave2master[1]);
+		close(master2slave[0]); close(master2slave[1]);
+		slave2master[0] = slave2master[1] = master2slave[0] = master2slave[1] = -1;
+		g_slavekvm = 0;
+		if (paused == 0 && ++g_kvmForkRetryCount < KVM_FORK_RETRY_MAX)
+		{
+			ILibLifeTime_AddEx(ILibGetBaseTimer(g_kvmChain), slave_out, KVM_FORK_RETRY_DELAY_MS, kvm_relay_forkRetrySink, NULL);
+			return slave_out;
+		}
+		g_kvmForkRetryCount = 0;
+		ILibProcessPipe_FreePipe(slave_out);
+		return NULL;
 	}
-	while (g_slavekvm == -1 && paused == 0 && ++count < 10);
-	if (g_slavekvm == -1) return(NULL);
 
 	if (g_slavekvm == 0) //slave
 	{
@@ -1463,7 +1862,6 @@ void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler w
 		close(master2slave[1]);
 
 		if (SLAVELOG != 0) { logFile = fopen("/tmp/slave", "w"); }
-		if (uid != 0) { ignore_result(setuid(uid)); }
 
 		if (g_ILibCrashDump_path != NULL)
 		{
@@ -1482,15 +1880,22 @@ void* kvm_relay_restart(int paused, void *processPipeMgr, ILibKVM_WriteHandler w
 		if (authToken != NULL) { setenv("XAUTHORITY", authToken, 1); }
 		if (dispid != NULL) { setenv("DISPLAY", dispid, 1); }
 
-		kvm_server_mainloop((void*)0);
-		exit(0);
+		kvm_server_mainloop((void*)(intptr_t)uid);
+		_exit(0);
 		return(NULL);
 	}
-	else 
+	else
 	{ //master
+		// A child is (re)running now: clear any stale shutdown flag left by kvm_cleanup() on a restart
+		// path, and stamp the fork time so the auto-recovery burst gate can tell a healthy child (ran a
+		// while) from a fork storm (dies immediately).
+		g_shutdown = 0;
+		g_kvmForkRetryCount = 0;
+		g_lastKvmForkMs = kvm_relay_now_ms();
 		close(slave2master[1]);
 		close(master2slave[0]);
-		logFile = fopen("/tmp/master", "w");
+		slave2master[0] = slave2master[1] = master2slave[0] = -1;
+		if (SLAVELOG != 0) { logFile = fopen("/tmp/master", "w"); }
 		char tmp[255];
 		sprintf_s(tmp, sizeof(tmp), "Child KVM (pid=%d)", g_slavekvm);
 
@@ -1523,14 +1928,7 @@ void kvm_relay_reset()
 // Clean up the KVM session.
 void kvm_cleanup()
 {
-	int code;
 	g_shutdown = 1;
-
-	if (master2slave[1] != 0 && g_slavekvm != 0) 
-	{ 
-		kill(g_slavekvm, SIGTERM); 
-		waitpid(g_slavekvm, &code, 0);
-		g_slavekvm = 0; 
-	}
+	kvm_relay_stop_child(SIGTERM);
 	g_totalRestartCount = 0;
 }

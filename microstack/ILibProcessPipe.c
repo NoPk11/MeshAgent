@@ -41,16 +41,103 @@ limitations under the License.
 	#if defined(__APPLE__)
 		#include <util.h>
 	#else
+		// open/freebsd
 		#include <termios.h>
-#ifdef _OPENBSD
-		#include <util.h>
-#else
-		#include <libutil.h>
-#endif
+		// added for ILibProcessPipe_ForkPTY_BSD()
+		#include <sys/ioctl.h>
+		#include <stdlib.h>
+		#include <errno.h>
 	#endif
 #endif
 #endif
 
+
+#if defined(__APPLE__)
+#include <bsm/audit.h>
+#include <bsm/audit_session.h>
+#include <libproc.h>
+#include <mach/mach.h>
+#include <string.h>
+
+// macOS Tahoe (26.x) audit-session-isolation fix for the -kvm0
+// helper. The screen-capture / input-injection helper inherits the
+// daemon's system-side audit session, where per-user XPC services
+// like com.apple.replayd (which backs ReplayKit / ScreenCaptureKit)
+// are unreachable. The cross-session XPC bootstrap-lookup fails with
+// "xpc_error=[3: No such process]" and the helper returns empty
+// (all-black) frames. Joining the console user's GUI audit session
+// before exec fixes this.
+//
+// Two call sites are needed:
+//   1. Pre-exec (in SpawnProcessEx4's fork-child, still root): does the
+//      actual discovery — Tahoe forbids non-root processes from
+//      enumerating with auditon() or calling audit_session_port() for
+//      arbitrary asids. Root can do both.
+//   2. Post-exec (in main.c -kvm0 branch, as the target uid): the
+//      kernel resets the asid on exec, so we need to re-join from the
+//      helper's main entry. The pre-exec join leaves enough kernel
+//      state that the post-exec auditon visibility works.
+static int ILibProcessPipe_TryJoinAsid_OSX(au_asid_t asid)
+{
+	mach_port_t port = MACH_PORT_NULL;
+	if (audit_session_port(asid, &port) != 0) return -1;
+	au_asid_t join_rc = audit_session_join(port);
+	mach_port_deallocate(mach_task_self(), port);
+	if (join_rc == AU_DEFAUDITSID || (int32_t)join_rc == -1) return -1;
+	return 0;
+}
+
+int ILibProcessPipe_JoinUserAuditSession_OSX(uid_t uid);
+int ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(uid_t uid) { return ILibProcessPipe_JoinUserAuditSession_OSX(uid); }
+int ILibProcessPipe_JoinUserAuditSession_OSX(uid_t uid)
+{
+	int n = proc_listallpids(NULL, 0);
+	if (n <= 0) return -1;
+	pid_t *pids = (pid_t*)calloc(n, sizeof(pid_t));
+	if (pids == NULL) return -1;
+	int got = proc_listallpids(pids, n * (int)sizeof(pid_t));
+	if (got <= 0) { free(pids); return -1; }
+	int count = got / (int)sizeof(pid_t);
+	int rc = -1;
+	// Discover all auditon-visible asids belonging to target uid;
+	// prefer the LOWEST asid as the candidate. The user's primary
+	// gui session is created early at login and gets a low asid
+	// (typically 100002), while transient and per-app sessions get
+	// higher asids (100041+, 101xxx). Picking lowest reliably lands
+	// us on the primary gui session, which is where replayd is.
+	au_asid_t best_asid = AU_DEFAUDITSID;
+	for (int i = 0; i < count; i++)
+	{
+		if (pids[i] == 0) continue;
+		struct auditpinfo_addr ap;
+		memset(&ap, 0, sizeof(ap));
+		ap.ap_pid = pids[i];
+		if (auditon(A_GETPINFO_ADDR, &ap, sizeof(ap)) != 0) continue;
+		if (ap.ap_auid != uid) continue;
+		if (ap.ap_asid == 0 || ap.ap_asid == AU_DEFAUDITSID) continue;
+		if (best_asid == AU_DEFAUDITSID || ap.ap_asid < best_asid) best_asid = ap.ap_asid;
+	}
+	free(pids);
+	if (best_asid != AU_DEFAUDITSID && ILibProcessPipe_TryJoinAsid_OSX(best_asid) == 0) rc = 0;
+	// Fallback: if auditon discovery yielded no usable asid (e.g.,
+	// Tahoe's cross-session visibility filter denied the enumeration),
+	// brute-force try the typical user-gui asid range from low to high.
+	if (rc != 0)
+	{
+		for (au_asid_t a = 100002; a <= 100200; a++)
+		{
+			if (ILibProcessPipe_TryJoinAsid_OSX(a) == 0)
+			{
+				struct auditinfo_addr post;
+				memset(&post, 0, sizeof(post));
+				getaudit_addr(&post, sizeof(post));
+				if (post.ai_auid == uid) { rc = 0; break; }
+			}
+		}
+	}
+	return rc;
+}
+#endif
 
 #define CONSOLE_SCREEN_WIDTH 80
 #define CONSOLE_SCREEN_HEIGHT 25
@@ -118,6 +205,8 @@ typedef struct ILibProcessPipe_Process_Object
 #else
 	pid_t PID;
 	int PTY;
+	int reaped;
+	int exitCode;
 #endif
 	void *userObject;
 	
@@ -296,8 +385,9 @@ ILibProcessPipe_Manager ILibProcessPipe_Manager_Create(void *chain)
 	return retVal;
 }
 
-void ILibProcessPipe_FreePipe(ILibProcessPipe_PipeObject *pipeObject)
+void ILibProcessPipe_FreePipe(ILibProcessPipe_Pipe pipe)
 {
+	ILibProcessPipe_PipeObject *pipeObject = (ILibProcessPipe_PipeObject*)pipe;
 	if (!ILibMemory_CanaryOK(pipeObject)) { return; }
 	ILibMemory_Free(pipeObject->metadata);
 #ifdef WIN32
@@ -450,6 +540,9 @@ void ILibProcessPipe_Process_Destroy(ILibProcessPipe_Process_Object *p)
 	if (!ILibMemory_CanaryOK(p)) { return; }
 
 	if (p->exiting != 0) { return; }
+#ifndef WIN32
+	ILibLifeTime_Remove(ILibGetBaseTimer(p->parent->ChainLink.ParentChain), p);
+#endif
 	if (p->stdIn != NULL) { ILibProcessPipe_FreePipe(p->stdIn); }
 	if (p->stdOut != NULL) { ILibProcessPipe_FreePipe(p->stdOut); }
 	if (p->stdErr != NULL) { ILibProcessPipe_FreePipe(p->stdErr); }
@@ -462,24 +555,40 @@ void ILibProcessPipe_Process_Destroy(ILibProcessPipe_Process_Object *p)
 #ifndef WIN32
 void ILibProcessPipe_Process_BrokenPipeSink_DestroyHandler(void *object)
 {
-	ILibProcessPipe_Process_Destroy((ILibProcessPipe_Process_Object*)object);
+	ILibProcessPipe_Process_Object *p = (ILibProcessPipe_Process_Object*)object;
+	if (!p->reaped)
+	{
+		int status;
+		pid_t result = waitpid(p->PID, &status, WNOHANG);
+		if (result == 0 || (result < 0 && errno == EINTR))
+		{
+			// Closing stdout does not imply the child has finished writing stderr.
+			ILibLifeTime_AddEx(ILibGetBaseTimer(p->parent->ChainLink.ParentChain), p, 50, ILibProcessPipe_Process_BrokenPipeSink_DestroyHandler, NULL);
+			return;
+		}
+		p->reaped = 1;
+		p->exitCode = result < 0 ? -1 : (WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+	}
+	if (p->stdOut != NULL && !p->stdOut->PAUSED) { ILibProcessPipe_Process_ReadHandler(p->stdOut); }
+	if (p->stdErr != NULL && !p->stdErr->PAUSED) { ILibProcessPipe_Process_ReadHandler(p->stdErr); }
+	if (p->exitHandler != NULL) { p->exitHandler(p, p->exitCode, p->userObject); }
+	p->exiting = 0;
+	ILibProcessPipe_Process_Destroy(p);
+}
+void ILibProcessPipe_Process_CheckExit(ILibProcessPipe_Process process)
+{
+	ILibProcessPipe_Process_Object *p = (ILibProcessPipe_Process_Object*)process;
+	if (ILibMemory_CanaryOK(p) && !p->exiting)
+	{
+		p->exiting = 1;
+		ILibLifeTime_Add(ILibGetBaseTimer(p->parent->ChainLink.ParentChain), p, 0, ILibProcessPipe_Process_BrokenPipeSink_DestroyHandler, NULL);
+	}
 }
 void ILibProcessPipe_Process_BrokenPipeSink(ILibProcessPipe_Pipe sender)
 {
-	ILibProcessPipe_Process_Object *p = ((ILibProcessPipe_PipeObject*)sender)->mProcess;
-	int status;
 	if (ILibIsRunningOnChainThread(((ILibProcessPipe_PipeObject*)sender)->manager->ChainLink.ParentChain) != 0)
 	{
-		// This was called from the Reader
-		if (p->exitHandler != NULL)
-		{
-
-			waitpid((pid_t)p->PID, &status, 0);
-			p->exitHandler(p, WEXITSTATUS(status), p->userObject);
-		}
-
-		// Unwind the stack, and destroy the process object
-		ILibLifeTime_Add(ILibGetBaseTimer(p->parent->ChainLink.ParentChain), p, 0, ILibProcessPipe_Process_BrokenPipeSink_DestroyHandler, NULL);
+		ILibProcessPipe_Process_CheckExit(((ILibProcessPipe_PipeObject*)sender)->mProcess);
 	}
 }
 #endif
@@ -493,8 +602,14 @@ void ILibProcessPipe_Process_SoftKill(ILibProcessPipe_Process p)
 	TerminateProcess(j->hProcess, 1067);
 #else
 	int code;
-	kill((pid_t)j->PID, SIGKILL);
-	waitpid((pid_t)j->PID, &code, 0);
+	pid_t result;
+	if (!j->reaped)
+	{
+		kill(j->PID, SIGKILL);
+		do { result = waitpid(j->PID, &code, 0); } while (result < 0 && errno == EINTR);
+		j->reaped = 1;
+		j->exitCode = result < 0 ? -1 : (WIFEXITED(code) ? WEXITSTATUS(code) : 128 + WTERMSIG(code));
+	}
 #endif
 }
 
@@ -507,6 +622,65 @@ void ILibProcessPipe_Process_HardKill(ILibProcessPipe_Process p)
 }
 
 
+
+#if defined(_FREEBSD)
+// Local replacement for libutil's forkpty()
+// Same interface as the real forkpty(): opens a pty pair, forks, and in the child makes the slave
+// side its controlling terminal on fd 0/1/2. Returns the child's pid to the parent
+// (with *amaster set to the master fd, matching forkpty()'s out-param), 0 to the
+// child, or -1 with errno set on failure.
+static pid_t ILibProcessPipe_ForkPTY_BSD(int *amaster, struct termios *termp, struct winsize *winp)
+{
+	int master, slave;
+	char slaveName[128];
+	pid_t pid;
+
+	if ((master = posix_openpt(O_RDWR | O_NOCTTY)) < 0) { return(-1); }
+	if (grantpt(master) != 0 || unlockpt(master) != 0) { close(master); return(-1); }
+#ifdef _OPENBSD
+	// OpenBSD has no ptsname_r() -- libc exports only ptsname(), and <stdlib.h>
+	// declares just "char *ptsname(int)". It returns a pointer to static storage,
+	// which is safe here only because the name is copied out immediately below,
+	// before anything else can call ptsname() on this thread.
+	{
+		char *nm = ptsname(master);
+		if (nm == NULL) { close(master); return(-1); }
+		if (strnlen_s(nm, sizeof(slaveName)) >= sizeof(slaveName)) { close(master); errno = ENAMETOOLONG; return(-1); }
+		strcpy_s(slaveName, sizeof(slaveName), nm);
+	}
+#else
+	if (ptsname_r(master, slaveName, sizeof(slaveName)) != 0) { close(master); return(-1); }
+#endif
+	if ((slave = open(slaveName, O_RDWR | O_NOCTTY)) < 0) { close(master); return(-1); }
+
+	if ((pid = fork()) < 0)
+	{
+		int e = errno;
+		close(slave); close(master);
+		errno = e;
+		return(-1);
+	}
+	if (pid == 0)
+	{
+		// Child: master is of no use here, only the slave side is inherited.
+		close(master);
+		if (setsid() < 0) { _exit(1); }
+		if (ioctl(slave, TIOCSCTTY, (char*)NULL) < 0) { _exit(1); }
+		if (termp != NULL) { tcsetattr(slave, TCSANOW, termp); }
+		if (winp != NULL) { ioctl(slave, TIOCSWINSZ, winp); }
+		dup2(slave, STDIN_FILENO);
+		dup2(slave, STDOUT_FILENO);
+		dup2(slave, STDERR_FILENO);
+		if (slave > STDERR_FILENO) { close(slave); }
+		return(0);
+	}
+	// Parent: the slave is only needed by the child.
+	close(slave);
+	*amaster = master;
+	return(pid);
+}
+#define forkpty(amaster, name, termp, winp) ILibProcessPipe_ForkPTY_BSD(amaster, termp, winp)
+#endif
 
 ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_Manager pipeManager, char* target, char* const* parameters, ILibProcessPipe_SpawnTypes spawnType, void *sid, void *envvars, int extraMemorySize)
 {
@@ -755,16 +929,12 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 			retVal->stdOut->mProcess = retVal;
 		}
 #ifdef __APPLE__
-		if (needSetSid == 0)
-		{
-			set = &sset;
-			ILibVForkPrepareSignals_Parent_Init(set);
-			pid = vfork();
-		}
-		else
-		{
-			pid = fork();
-		}
+		// Use fork() not vfork() on macOS — child needs to call
+		// proc_listallpids / audit_session_join APIs to join the
+		// console user's audit session before exec, which are
+		// forbidden in vfork-child context (POSIX requires
+		// execve/_exit only in vfork children).
+		pid = fork();
 #else
 		set = &sset;
 		ILibVForkPrepareSignals_Parent_Init(set);
@@ -825,6 +995,19 @@ ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcessEx4(ILibProcessPipe_
 		}
 		if (UID != -1 && UID != 0)
 		{
+#if defined(__APPLE__)
+			// Tahoe: macOS forbids non-root processes from calling
+			// audit_session_port() for arbitrary asids (errno=EPERM)
+			// or enumerating with auditon(A_GETPINFO_ADDR) across
+			// sessions. So we MUST do the audit-session-join here,
+			// while the fork-child still has root privileges, before
+			// setuid drops us. Otherwise the helper post-exec runs
+			// as the target user with no authority to discover or
+			// join the user's gui audit session, and stays in the
+			// daemon's system-side session — where com.apple.replayd
+			// is unreachable, breaking screen capture.
+			ILibProcessPipe_JoinUserAuditSession_OSX((uid_t)UID);
+#endif
 			ignore_result(setuid((uid_t)UID));
 		}
 		if (needSetSid != 0)
@@ -1443,7 +1626,7 @@ BOOL ILibProcessPipe_Process_OnExit(void *chain, HANDLE event, ILibWaitHandle_Er
 #endif
 void ILibProcessPipe_Process_UpdateUserObject(ILibProcessPipe_Process module, void *userObj)
 {
-	((ILibProcessPipe_Process_Object*)module)->userObject = userObj;
+	if (ILibMemory_CanaryOK(module)) { ((ILibProcessPipe_Process_Object*)module)->userObject = userObj; }
 }
 #ifdef WIN32
 void ILibProcessPipe_Process_RemoveHandlers(ILibProcessPipe_Process module)
@@ -1464,9 +1647,9 @@ void ILibProcessPipe_Process_AddHandlers(ILibProcessPipe_Process module, int buf
 		j->userObject = user;
 		j->exitHandler = exitHandler;
 
-		if (j->stdOut->metadata == NULL) { j->stdOut->metadata = "process_handle_stdout"; }
-		if (j->stdErr->metadata == NULL) { j->stdOut->metadata = "process_handle_stderr"; }
-		if (j->metadata == NULL) { j->metadata = "process_handle_exit"; }
+		if (j->stdOut->metadata == NULL) { j->stdOut->metadata = ILibMemory_SmartAllocate_FromString("process_handle_stdout"); }
+		if (j->stdErr->metadata == NULL) { j->stdErr->metadata = ILibMemory_SmartAllocate_FromString("process_handle_stderr"); }
+		if (j->metadata == NULL) { j->metadata = ILibMemory_SmartAllocate_FromString("process_handle_exit"); }
 
 		ILibProcessPipe_Process_StartPipeReaderEx(j->stdOut, bufferSize, &ILibProcessPipe_Process_PipeHandler_StdOut, j, stdOut, NULL);
 		ILibProcessPipe_Process_StartPipeReaderEx(j->stdErr, bufferSize, &ILibProcessPipe_Process_PipeHandler_StdOut, j, stdErr, NULL);
@@ -1751,4 +1934,3 @@ DWORD ILibProcessPipe_Process_GetPID(ILibProcessPipe_Process p) { return(p != NU
 pid_t ILibProcessPipe_Process_GetPID(ILibProcessPipe_Process p) { return(p != NULL ? (pid_t)((ILibProcessPipe_Process_Object*)p)->PID : 0); }
 int ILibProcessPipe_Process_GetPTY(ILibProcessPipe_Process p) { return(p != NULL ? ((ILibProcessPipe_Process_Object*)p)->PTY : 0); }
 #endif
-
