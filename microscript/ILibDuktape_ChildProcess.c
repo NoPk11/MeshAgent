@@ -142,7 +142,6 @@ void ILibDuktape_ChildProcess_SubProcess_ExitHandler(ILibProcessPipe_Process sen
 
 	p->exitCode = exitCode;
 	p->childProcess = NULL;
-	if (!duk_ctx_is_alive(p->ctx) || duk_ctx_shutting_down(p->ctx)) { return; }
 	duk_push_heapptr(p->ctx, p->subProcess);																// [childProcess]
 
 #if defined(_POSIX)
@@ -160,8 +159,6 @@ void ILibDuktape_ChildProcess_SubProcess_ExitHandler(ILibProcessPipe_Process sen
 		ILibChain_EndContinue(Duktape_GetChain(p->ctx));
 	}
 
-	// Keep the process object alive while exit listeners release their references.
-	duk_dup(p->ctx, -1);
 	duk_get_prop_string(p->ctx, -1, "emit");		// [childProcess][emit]
 	duk_swap_top(p->ctx, -2);						// [emit][this]
 	duk_push_string(p->ctx, "exit");				// [emit][this][exit]
@@ -170,6 +167,7 @@ void ILibDuktape_ChildProcess_SubProcess_ExitHandler(ILibProcessPipe_Process sen
 	if (duk_pcall_method(p->ctx, 3) != 0) { ILibDuktape_Process_UncaughtExceptionEx(p->ctx, "child_process.subProcess.exit(): "); }
 	duk_pop(p->ctx);
 
+	duk_push_heapptr(p->ctx, p->subProcess);		// [childProcess]
 	ILibDuktape_ChildProcess_DeleteBackReferences(p->ctx, -1, "stdin");
 	ILibDuktape_ChildProcess_DeleteBackReferences(p->ctx, -1, "stdout");
 	ILibDuktape_ChildProcess_DeleteBackReferences(p->ctx, -1, "stderr");
@@ -178,18 +176,18 @@ void ILibDuktape_ChildProcess_SubProcess_ExitHandler(ILibProcessPipe_Process sen
 void ILibDuktape_ChildProcess_SubProcess_StdOutHandler(ILibProcessPipe_Process sender, char *buffer, size_t bufferLen, size_t* bytesConsumed, void* user)
 {
 	ILibDuktape_ChildProcess_SubProcess *p = (ILibDuktape_ChildProcess_SubProcess*)user;
-	*bytesConsumed = bufferLen;
-	if (!ILibMemory_CanaryOK(p) || !duk_ctx_is_alive(p->ctx) || duk_ctx_shutting_down(p->ctx)) { return; }
+	if (!ILibMemory_CanaryOK(p)) { return; }
 
 	ILibDuktape_readableStream_WriteData(p->stdOut, buffer, bufferLen);
+	*bytesConsumed = bufferLen;
 }
 void ILibDuktape_ChildProcess_SubProcess_StdErrHandler(ILibProcessPipe_Process sender, char *buffer, size_t bufferLen, size_t* bytesConsumed, void* user)
 {
 	ILibDuktape_ChildProcess_SubProcess *p = (ILibDuktape_ChildProcess_SubProcess*)user;
-	*bytesConsumed = bufferLen;
-	if (!ILibMemory_CanaryOK(p) || !duk_ctx_is_alive(p->ctx) || duk_ctx_shutting_down(p->ctx)) { return; }
+	if (!ILibMemory_CanaryOK(p)) { return; }
 
 	ILibDuktape_readableStream_WriteData(p->stdErr, buffer, bufferLen);
+	*bytesConsumed = bufferLen;
 }
 void ILibDuktape_ChildProcess_SubProcess_SendOK(ILibProcessPipe_Process sender, void* user)
 {
@@ -272,9 +270,8 @@ duk_ret_t ILibDuktape_ChildProcess_waitExit(duk_context *ctx)
 }
 duk_ret_t ILibDuktape_ChildProcess_SpawnedProcess_Finalizer(duk_context *ctx)
 {
-	ILibDuktape_ChildProcess_SubProcess *retVal = (ILibDuktape_ChildProcess_SubProcess*)Duktape_GetBufferProperty(ctx, 0, ILibDuktape_ChildProcess_MemBuf);
-	if (retVal->childProcess != NULL) { ILibProcessPipe_Process_UpdateUserObject(retVal->childProcess, NULL); }
 #ifdef WIN32
+	ILibDuktape_ChildProcess_SubProcess *retVal = (ILibDuktape_ChildProcess_SubProcess*)Duktape_GetBufferProperty(ctx, 0, ILibDuktape_ChildProcess_MemBuf);
 	ILibProcessPipe_Process_RemoveHandlers(retVal->childProcess);
 #endif
 	duk_get_prop_string(ctx, 0, "kill");	// [kill]
@@ -332,6 +329,7 @@ duk_ret_t ILibDuktape_SpawnedProcess_descriptorSetter(duk_context *ctx)
 }
 
 #if defined(_POSIX) 
+extern void ILibProcessPipe_Process_Destroy(void *p);
 duk_ret_t ILibDuktape_SpawnedProcess_SIGCHLD_sink(duk_context *ctx)
 {
 	int statusCode = duk_require_int(ctx, 1);
@@ -342,13 +340,6 @@ duk_ret_t ILibDuktape_SpawnedProcess_SIGCHLD_sink(duk_context *ctx)
 
 	if (Duktape_GetIntPropertyValue(ctx, -1, "pid", -1) == pid)
 	{
-		if (duk_has_prop_string(ctx, -1, "stdout"))
-		{
-			// SIGCHLD and pipe EOF must share one exit callback and keep pending output alive.
-			ILibDuktape_ChildProcess_SubProcess *p = (ILibDuktape_ChildProcess_SubProcess*)Duktape_GetBufferProperty(ctx, -1, ILibDuktape_ChildProcess_MemBuf);
-			if (p != NULL) { ILibProcessPipe_Process_CheckExit(p->childProcess); }
-			return 0;
-		}
 		// This SIGCHLD is for us. Let's unhook from SIGCHLD
 		duk_del_prop_string(ctx, -1, "_sigsink");
 		ILibDuktape_EventEmitter_SetupRemoveListener(ctx, ILibDuktape_GetProcessObject(ctx), "SIGCHLD");	// [remove][this][SIGCHLD]
@@ -364,6 +355,20 @@ duk_ret_t ILibDuktape_SpawnedProcess_SIGCHLD_sink(duk_context *ctx)
 			duk_push_null(ctx);										// [child][emit][this][exit][code][null]
 			duk_call_method(ctx, 3); duk_pop(ctx);					// [child]
 		}
+		else
+		{
+			// We are not detached, so we need to call the same method that broken pipe would've
+			ILibDuktape_ChildProcess_SubProcess *childprocess = (ILibDuktape_ChildProcess_SubProcess*)Duktape_GetBufferProperty(ctx, -1, ILibDuktape_ChildProcess_MemBuf);
+			if (childprocess != NULL)
+			{
+				ILibDuktape_ChildProcess_SubProcess_ExitHandler(childprocess->childProcess, statusCode, childprocess);
+			}	
+			duk_push_heapptr(ctx, child);
+			ILibDuktape_ChildProcess_DeleteBackReferences(ctx, -1, "stdin");
+			ILibDuktape_ChildProcess_DeleteBackReferences(ctx, -1, "stdout");
+			ILibDuktape_ChildProcess_DeleteBackReferences(ctx, -1, "stderr");
+			duk_pop(ctx);
+		}
 
 		duk_push_current_function(ctx);							// [func]
 		duk_del_prop_string(ctx, -1, "_child");
@@ -375,7 +380,7 @@ duk_ret_t ILibDuktape_SpawnedProcess_SIGCHLD_sink(duk_context *ctx)
 		{
 			duk_del_prop_string(ctx, -1, ILibDuktape_ChildProcess_Process);
 			duk_del_prop_string(ctx, -1, ILibDuktape_ChildProcess_MemBuf);
-			ILibProcessPipe_Process_CheckExit(mProcess);
+			ILibProcessPipe_Process_Destroy(mProcess);
 		}
 	}
 
