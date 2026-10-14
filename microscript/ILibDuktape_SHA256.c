@@ -118,9 +118,10 @@ void ILibDuktape_SHA256_End(struct ILibDuktape_WritableStream *stream, void *use
 	ILibDuktape_SHA256_Data *data = (ILibDuktape_SHA256_Data*)user;
 	SHA256_Final((unsigned char*)data->buffer, &(data->shctx));
 
-	memcpy_s(duk_push_fixed_buffer(data->ctx, UTIL_SHA256_HASHSIZE), UTIL_SHA256_HASHSIZE, data->buffer, UTIL_SHA256_HASHSIZE);	// [hashBuffer]
-	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");						// [hashBuffer][emit][this]['hash']
-	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA256_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [hashBuffer][emit][this]['hash'][hash]
+	duk_push_external_buffer(data->ctx);														// [extBuffer]
+	duk_config_buffer(data->ctx, -1, data->buffer, UTIL_SHA256_HASHSIZE);
+	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");						// [extBuffer][emit][this]['hash']
+	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA256_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [extBuffer][emit][this]['hash'][hash]
 	if (duk_pcall_method(data->ctx, 2) != 0) { ILibDuktape_Process_UncaughtException(data->ctx); }
 	duk_pop_2(data->ctx);																		// ...
 }
@@ -129,9 +130,10 @@ void ILibDuktape_SHA384_End(struct ILibDuktape_WritableStream *stream, void *use
 	ILibDuktape_SHA512_Data *data = (ILibDuktape_SHA512_Data*)user;
 	SHA384_Final((unsigned char*)data->buffer, &(data->shctx));
 
-	memcpy_s(duk_push_fixed_buffer(data->ctx, UTIL_SHA384_HASHSIZE), UTIL_SHA384_HASHSIZE, data->buffer, UTIL_SHA384_HASHSIZE);	// [hashBuffer]
-	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");						// [hashBuffer][emit][this]['hash']
-	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA384_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [hashBuffer][emit][this]['hash'][hash]
+	duk_push_external_buffer(data->ctx);														// [extBuffer]
+	duk_config_buffer(data->ctx, -1, data->buffer, UTIL_SHA384_HASHSIZE);
+	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");						// [extBuffer][emit][this]['hash']
+	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA384_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [extBuffer][emit][this]['hash'][hash]
 	if (duk_pcall_method(data->ctx, 2) != 0) { ILibDuktape_Process_UncaughtException(data->ctx); }
 	duk_pop_2(data->ctx);																		// ...
 }
@@ -427,7 +429,8 @@ duk_ret_t ILibDuktape_SHA256_syncHash(duk_context *ctx)
 	SHA256_Update(&(data->shctx), buffer, bufferLen);
 	SHA256_Final((unsigned char*)data->buffer, &(data->shctx));
 
-	memcpy_s(duk_push_fixed_buffer(ctx, UTIL_SHA256_HASHSIZE), UTIL_SHA256_HASHSIZE, data->buffer, UTIL_SHA256_HASHSIZE);
+	duk_push_external_buffer(ctx);
+	duk_config_buffer(ctx, -1, data->buffer, UTIL_SHA256_HASHSIZE);
 	duk_push_buffer_object(ctx, -1, 0, UTIL_SHA256_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);
 
 	return(1);
@@ -446,7 +449,8 @@ duk_ret_t ILibDuktape_SHA384_syncHash(duk_context *ctx)
 	SHA384_Update(&(data->shctx), buffer, bufferLen);
 	SHA384_Final((unsigned char*)data->buffer, &(data->shctx));
 
-	memcpy_s(duk_push_fixed_buffer(ctx, UTIL_SHA384_HASHSIZE), UTIL_SHA384_HASHSIZE, data->buffer, UTIL_SHA384_HASHSIZE);
+	duk_push_external_buffer(ctx);
+	duk_config_buffer(ctx, -1, data->buffer, UTIL_SHA384_HASHSIZE);
 	duk_push_buffer_object(ctx, -1, 0, UTIL_SHA384_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);
 
 	return(1);
@@ -464,10 +468,11 @@ void ILibDuktape_MD5_End(struct ILibDuktape_WritableStream *stream, void *user)
 	ILibDuktape_MD5_Data *data = (ILibDuktape_MD5_Data*)user;
 	MD5_Final((unsigned char*)data->buffer, &(data->mctx));
 
-	memcpy_s(duk_push_fixed_buffer(data->ctx, UTIL_MD5_HASHSIZE), UTIL_MD5_HASHSIZE, data->buffer, UTIL_MD5_HASHSIZE);	// [hashBuffer]
-	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");					// [hashBuffer][emit][this]["hash"]
-	duk_push_buffer_object(data->ctx, -4, 0, UTIL_MD5_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [hashBuffer][emit][this]["hash"][buffer]
-	if (duk_pcall_method(data->ctx, 2) != 0)												// [hashBuffer][retVal]
+	duk_push_external_buffer(data->ctx);													// [extBuffer]
+	duk_config_buffer(data->ctx, -1, data->buffer, UTIL_MD5_HASHSIZE);
+	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");					// [extBuffer][emit][this]["hash"]
+	duk_push_buffer_object(data->ctx, -4, 0, UTIL_MD5_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [extBuffer][emit][this]["hash"][buffer]
+	if (duk_pcall_method(data->ctx, 2) != 0)												// [extBuffer][retVal]
 	{
 		ILibDuktape_Process_UncaughtException(data->ctx);
 	}
@@ -487,7 +492,8 @@ duk_ret_t ILibDuktape_MD5_syncHash(duk_context *ctx)
 	MD5_Update(&(data->mctx), buffer, bufferLen);
 	MD5_Final((unsigned char*)data->buffer, &(data->mctx));
 
-	memcpy_s(duk_push_fixed_buffer(ctx, UTIL_MD5_HASHSIZE), UTIL_MD5_HASHSIZE, data->buffer, UTIL_MD5_HASHSIZE);
+	duk_push_external_buffer(ctx);
+	duk_config_buffer(ctx, -1, data->buffer, UTIL_MD5_HASHSIZE);
 	duk_push_buffer_object(ctx, -1, 0, UTIL_MD5_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);
 
 	return(1);
@@ -552,9 +558,10 @@ void ILibDuktape_SHA512_End(struct ILibDuktape_WritableStream *stream, void *use
 	ILibDuktape_SHA512_Data *data = (ILibDuktape_SHA512_Data*)user;
 	SHA512_Final((unsigned char*)data->buffer, &(data->shctx));
 
-	memcpy_s(duk_push_fixed_buffer(data->ctx, UTIL_SHA512_HASHSIZE), UTIL_SHA512_HASHSIZE, data->buffer, UTIL_SHA512_HASHSIZE);	// [hashBuffer]
-	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");						// [hashBuffer][emit][this]['hash']
-	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA512_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [hashBuffer][emit][this]['hash'][hash]
+	duk_push_external_buffer(data->ctx);														// [extBuffer]
+	duk_config_buffer(data->ctx, -1, data->buffer, UTIL_SHA512_HASHSIZE);
+	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");						// [extBuffer][emit][this]['hash']
+	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA512_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [extBuffer][emit][this]['hash'][hash]
 	if (duk_pcall_method(data->ctx, 2) != 0) { ILibDuktape_Process_UncaughtException(data->ctx); }
 	duk_pop_2(data->ctx);																		// ...
 }
@@ -572,7 +579,8 @@ duk_ret_t ILibDuktape_SHA512_syncHash(duk_context *ctx)
 	SHA512_Update(&(data->shctx), buffer, bufferLen);
 	SHA512_Final((unsigned char*)data->buffer, &(data->shctx));
 
-	memcpy_s(duk_push_fixed_buffer(ctx, UTIL_SHA512_HASHSIZE), UTIL_SHA512_HASHSIZE, data->buffer, UTIL_SHA512_HASHSIZE);
+	duk_push_external_buffer(ctx);
+	duk_config_buffer(ctx, -1, data->buffer, UTIL_SHA512_HASHSIZE);
 	duk_push_buffer_object(ctx, -1, 0, UTIL_SHA512_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);
 
 	return(1);
@@ -639,10 +647,11 @@ void ILibDuktape_SHA1_End(struct ILibDuktape_WritableStream *stream, void *user)
 	ILibDuktape_SHA1_Data *data = (ILibDuktape_SHA1_Data*)user;
 	SHA1_Final((unsigned char*)data->buffer, &(data->sctx));
 
-	memcpy_s(duk_push_fixed_buffer(data->ctx, UTIL_SHA1_HASHSIZE), UTIL_SHA1_HASHSIZE, data->buffer, UTIL_SHA1_HASHSIZE);	// [hashBuffer]
-	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");					// [hashBuffer][emit][this]["hash"]
-	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA1_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [hashBuffer][emit][this]["hash"][buffer]
-	if (duk_pcall_method(data->ctx, 2) != 0)												// [hashBuffer][retVal]
+	duk_push_external_buffer(data->ctx);													// [extBuffer]
+	duk_config_buffer(data->ctx, -1, data->buffer, UTIL_SHA1_HASHSIZE);
+	ILibDuktape_EventEmitter_SetupEmit(data->ctx, data->object, "hash");					// [extBuffer][emit][this]["hash"]
+	duk_push_buffer_object(data->ctx, -4, 0, UTIL_SHA1_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);	// [extBuffer][emit][this]["hash"][buffer]
+	if (duk_pcall_method(data->ctx, 2) != 0)												// [extBuffer][retVal]
 	{
 		ILibDuktape_Process_UncaughtException(data->ctx);
 	}
@@ -662,7 +671,8 @@ duk_ret_t ILibDuktape_SHA1_syncHash(duk_context *ctx)
 	SHA1_Update(&(data->sctx), buffer, bufferLen);
 	SHA1_Final((unsigned char*)data->buffer, &(data->sctx));
 
-	memcpy_s(duk_push_fixed_buffer(ctx, UTIL_SHA1_HASHSIZE), UTIL_SHA1_HASHSIZE, data->buffer, UTIL_SHA1_HASHSIZE);
+	duk_push_external_buffer(ctx);
+	duk_config_buffer(ctx, -1, data->buffer, UTIL_SHA1_HASHSIZE);
 	duk_push_buffer_object(ctx, -1, 0, UTIL_SHA1_HASHSIZE, DUK_BUFOBJ_NODEJS_BUFFER);
 
 	return(1);
