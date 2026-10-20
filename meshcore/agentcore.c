@@ -2564,6 +2564,10 @@ void agent_LoadClientCertificate(MeshAgentHostContainer *agent)
 duk_context* ScriptEngine_Stop(MeshAgentHostContainer *agent, char *contextGUID)
 {
 	SCRIPT_ENGINE_SETTINGS *settings = ILibDuktape_ScriptContainer_GetSettings(agent->meshCoreCtx);
+	// WikiTech diag (2026-10-20): a core teardown flushes every JS timer; if the new core then fails part-way through its
+	// init, the agent is left connected and console-responsive but with NO timers = exactly the fleet's "silent agent".
+	sprintf_s(ILibScratchPad2, sizeof(ILibScratchPad2), "MeshCore: engine stop/restart requested (timers armed before: %ld)", ILibLifeTime_Count(ILibGetBaseTimer(agent->chain)));
+	ILIBLOGMESSSAGE(ILibScratchPad2);
 	Duktape_SafeDestroyHeap(agent->meshCoreCtx);
 
 	agent->meshCoreCtx = ILibDuktape_ScriptContainer_InitializeJavaScriptEngineEx2(settings);
@@ -3349,11 +3353,14 @@ void MeshServer_ProcessCommand(ILibWebClient_StateObject WebStateObject, MeshAge
 					//printf("CORE: Restart\r\n");
 					ILibRemoteLogging_printf(ILibChainGetLogger(agent->chain), ILibRemoteLogging_Modules_Microstack_Generic | ILibRemoteLogging_Modules_ConsolePrint,
 						ILibRemoteLogging_Flags_VerbosityLevel_1, "MeshCore: Restart");
+					ILIBLOGMESSSAGE("MeshCore: server pushed a different core (hash changed) -> restarting the JS engine"); // WikiTech diag
 					if ((coreException = ScriptEngine_Restart(agent, MeshAgent_JavaCore_ContextGuid, coremodule + 4, (int)coremoduleLen - 4)) != NULL)
 					{
 						ILibRemoteLogging_printf(ILibChainGetLogger(agent->chain), ILibRemoteLogging_Modules_Microstack_Generic | ILibRemoteLogging_Modules_ConsolePrint,
 							ILibRemoteLogging_Flags_VerbosityLevel_1, "MeshCore: Error: %s", coreException);
 						// TODO: Ylian: New Java Core threw an exception... Exception String is stored in 'coreException'
+						sprintf_s(ILibScratchPad2, sizeof(ILibScratchPad2), "MeshCore: NEW CORE THREW during init (timers now %ld): %.400s", ILibLifeTime_Count(ILibGetBaseTimer(agent->chain)), coreException); // WikiTech diag
+						ILIBLOGMESSSAGE(ILibScratchPad2);
 					}
 
 					// Since we did a big write to the data store, good time to compact the store
@@ -3372,6 +3379,7 @@ void MeshServer_ProcessCommand(ILibWebClient_StateObject WebStateObject, MeshAge
 			else if (cmdLen == 4)
 			{
 				// Server is telling us to stop running a core
+				ILIBLOGMESSSAGE("MeshCore: server told us to STOP the core (no core will run until one is pushed)"); // WikiTech diag
 				ILibSimpleDataStore_Delete(agent->masterDb, "CoreModule"); // Clear the core from datastore
 																		  
 				// Stop the current JavaScript core if present and launch the new one.

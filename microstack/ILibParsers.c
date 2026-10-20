@@ -7704,6 +7704,14 @@ long long ILibLifeTime_GetExpiration(void *LifetimeMonitorObject, void *data)
 \param line (Autofilled)
 \param metadata Metadata to be associated with this timer
 */
+// WikiTech diag (2026-10-20): fleet agents lose every JS timer (meshcore setInterval: metric sampler/flush, self-heal, GC)
+// with no trace - the socket stays up, the console answers, 'timerinfo' is empty. Log every path that silently prunes or
+// empties the lifetime list, plus core-engine restarts (agentcore.c), into the agent errorlog (<exe>.log, read with the
+// 'errorlog' console command). Rate-limited per process so a pathological loop cannot fill the disk.
+static int ILibLifeTime_DiagBudget = 80;
+static int ILibLifeTime_RemoveQuiet = 0; // set around the Remove() that AddEx does before re-adding (a legit transient empty)
+#define ILIBLIFETIME_DIAG(...) do { if (ILibLifeTime_DiagBudget > 0) { char _wtd[640]; --ILibLifeTime_DiagBudget; snprintf(_wtd, sizeof(_wtd), __VA_ARGS__); ILibCriticalLog(_wtd, __FILE__, __LINE__, 0, 0); } } while (0)
+
 ILibLifeTime_Token ILibLifeTime_AddEx4(void *LifetimeMonitorObject, void *data, int ms, ILibLifeTime_OnCallback Callback, ILibLifeTime_OnCallback Destroy, char *file, uint32_t line, char *metadata)
 {
 	struct LifeTimeMonitorData *temp;
@@ -7716,7 +7724,9 @@ ILibLifeTime_Token ILibLifeTime_AddEx4(void *LifetimeMonitorObject, void *data, 
 		if (Destroy != NULL) { Destroy(data); }
 		return(NULL);
 	}
+	ILibLifeTime_RemoveQuiet = 1; // WikiTech diag: remove-then-add is not a real "list emptied"
 	ILibLifeTime_Remove(LifetimeMonitorObject, data);
+	ILibLifeTime_RemoveQuiet = 0;
 
 	ltms = (struct LifeTimeMonitorData*)ILibMemory_SmartAllocate(sizeof(struct LifeTimeMonitorData));
 
@@ -7844,6 +7854,7 @@ void ILibLifeTime_Check(void *LifeTimeMonitorObject, fd_set *readset, fd_set *wr
 	{
 		if ((Temp = (struct LifeTimeMonitorData*)ILibLinkedList_GetDataFromNode(node)) == NULL || ILibMemory_CanaryOK(Temp)==0)
 		{
+			ILIBLIFETIME_DIAG("TIMER DROPPED: node data %p failed canary/NULL in Check (list %ld)", (void*)Temp, (long)ILibQueue_GetCount(LifeTimeMonitor->ObjectList)); // WikiTech diag
 			node = ILibLinkedList_Remove(node);
 			continue;
 		}
@@ -7863,11 +7874,13 @@ void ILibLifeTime_Check(void *LifeTimeMonitorObject, fd_set *readset, fd_set *wr
 	//
 	// Iterate through all the triggers that we need to fire
 	//
+	long wtFired = 0; char wtFiredMeta[320]; size_t wtFm = 0; wtFiredMeta[0] = 0; // WikiTech diag
 	node = ILibQueue_DeQueue(EventQueue);
 	while (node != NULL && ILibMemory_CanaryOK(node))
 	{
 		// Trigger the callback
 		EVT = (struct LifeTimeMonitorData*)node;
+		++wtFired; if (wtFm < sizeof(wtFiredMeta) - 4) { int _n = snprintf(wtFiredMeta + wtFm, sizeof(wtFiredMeta) - wtFm, "%s%s", wtFm ? "," : "", (EVT->metadata != NULL) ? EVT->metadata : (EVT->file != NULL ? EVT->file : "?")); if (_n > 0) { wtFm += (size_t)_n; if (wtFm > sizeof(wtFiredMeta) - 1) { wtFm = sizeof(wtFiredMeta) - 1; } } } // WikiTech diag
 		LifeTimeMonitor->CurrentTriggeredMetaData = EVT->metadata;
 		EVT->CallbackPtr(EVT->data);
 		LifeTimeMonitor->CurrentTriggeredMetaData = NULL;
@@ -7876,6 +7889,8 @@ void ILibLifeTime_Check(void *LifeTimeMonitorObject, fd_set *readset, fd_set *wr
 		ILibMemory_Free(EVT);
 		node = ILibQueue_DeQueue(EventQueue);
 	}
+	if (node != NULL) { ILIBLIFETIME_DIAG("TIMER DROPPED: fired-queue node %p failed canary mid-dispatch after %ld fired [%s]", node, wtFired, wtFiredMeta); } // WikiTech diag: loop exited on a bad canary, remaining callbacks never ran
+	if (wtFired > 0 && ILibQueue_GetCount(LifeTimeMonitor->ObjectList) == 0) { ILIBLIFETIME_DIAG("TIMER LIST EMPTY after dispatching %ld [%s]", wtFired, wtFiredMeta); } // WikiTech diag: meshcore keeps ~7 intervals armed, so this is never normal
 	LifeTimeMonitor->ActiveList = NULL;
 
 	// Compute how much time until next trigger
@@ -7988,6 +8003,11 @@ int ILibLifeTime_Remove(void *LifeTimeToken, void *data)
 	//
 	// Iterate through each node that is to be removed
 	//
+	if (ILibLifeTime_RemoveQuiet == 0 && ILibQueue_GetCount(EventQueue) > 0 && ILibQueue_GetCount(UPnPLifeTime->ObjectList) == 0) // WikiTech diag
+	{
+		struct LifeTimeMonitorData *wtE = (struct LifeTimeMonitorData*)ILibQueue_PeekQueue(EventQueue);
+		ILIBLIFETIME_DIAG("TIMER LIST EMPTY after Remove(data %p) [%s]", data, (wtE != NULL && ILibMemory_CanaryOK(wtE) && wtE->metadata != NULL) ? wtE->metadata : "?");
+	}
 	evt = (struct LifeTimeMonitorData*)ILibQueue_DeQueue(EventQueue);
 	while (evt != NULL && ILibMemory_CanaryOK(evt))
 	{
@@ -8009,6 +8029,7 @@ void ILibLifeTime_Flush(void *LifeTimeToken)
 	struct ILibLifeTime *UPnPLifeTime = (struct ILibLifeTime*)LifeTimeToken;
 	struct LifeTimeMonitorData *temp;
 
+	ILIBLIFETIME_DIAG("TIMER FLUSH: %ld timers (chain shutdown)", (long)ILibQueue_GetCount(UPnPLifeTime->ObjectList)); // WikiTech diag
 	ILibLinkedList_Lock(UPnPLifeTime->ObjectList);
 
 	temp = (struct LifeTimeMonitorData*)ILibQueue_DeQueue(UPnPLifeTime->ObjectList);

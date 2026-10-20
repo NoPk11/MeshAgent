@@ -764,6 +764,13 @@ void ILibDuktape_Process_UncaughtExceptionEx(duk_context *ctx, char *format, ...
 		len += sprintf_s(dest + len, sizeof(dest) - len, " => %s", errmsg);
 	}
 
+	// WikiTech diag (2026-10-20): also persist uncaught JS exceptions to the agent errorlog (rate-limited); the core's own
+	// 'uncaughtException' listener only forwards them to a console session that is usually not there.
+	{
+		static int wtUncaughtBudget = 40;
+		if (wtUncaughtBudget > 0) { --wtUncaughtBudget; ILibCriticalLog(dest, "uncaughtException", 0, 0, 0); }
+	}
+
 	if (emitter != NULL)
 	{
 		duk_push_heapptr(emitter->ctx, emitter->object);								// [process]
