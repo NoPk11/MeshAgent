@@ -1,9 +1,9 @@
 name: FreeBSD Build
 run-name: Build FreeBSD versions of MeshAgent
 on:
-  push:
-    branches: ['**']
-  pull_request:
+  # WikiTech: not built on push (we do not ship this platform from the fork; GitHub macOS arm64
+  # runners also time out under capacity). Run by hand from the Actions tab when needed.
+  workflow_dispatch:
   workflow_call:
 permissions:
   contents: read
