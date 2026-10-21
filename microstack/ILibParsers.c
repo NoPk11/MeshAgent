@@ -7711,6 +7711,28 @@ long long ILibLifeTime_GetExpiration(void *LifetimeMonitorObject, void *data)
 static int ILibLifeTime_DiagBudget = 80;
 static int ILibLifeTime_RemoveQuiet = 0; // set around the Remove() that AddEx does before re-adding (a legit transient empty)
 #define ILIBLIFETIME_DIAG(...) do { if (ILibLifeTime_DiagBudget > 0) { char _wtd[640]; --ILibLifeTime_DiagBudget; snprintf(_wtd, sizeof(_wtd), __VA_ARGS__); ILibCriticalLog(_wtd, __FILE__, __LINE__, 0, 0); } } while (0)
+static int ILibLifeTime_CorruptHits = 0; // WikiTech diag: bad nodes met by Check in this process
+// WikiTech diag: read a (possibly freed) list node's four raw fields without faulting. Returns 0 if unreadable.
+static int ILibLinkedList_PeekNode(void *node, void **data, void **root, void **next, void **prev)
+{
+	*data = *root = *next = *prev = NULL;
+	if (node == NULL) { return(0); }
+#ifdef WIN32
+	__try
+	{
+		struct ILibLinkedListNode *n = (struct ILibLinkedListNode*)node;
+		*data = n->Data; *root = (void*)n->Root; *next = (void*)n->Next; *prev = (void*)n->Previous;
+		return(1);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return(0); }
+#else
+	{
+		struct ILibLinkedListNode *n = (struct ILibLinkedListNode*)node;
+		*data = n->Data; *root = (void*)n->Root; *next = (void*)n->Next; *prev = (void*)n->Previous;
+		return(1);
+	}
+#endif
+}
 
 ILibLifeTime_Token ILibLifeTime_AddEx4(void *LifetimeMonitorObject, void *data, int ms, ILibLifeTime_OnCallback Callback, ILibLifeTime_OnCallback Destroy, char *file, uint32_t line, char *metadata)
 {
@@ -7854,7 +7876,24 @@ void ILibLifeTime_Check(void *LifeTimeMonitorObject, fd_set *readset, fd_set *wr
 	{
 		if ((Temp = (struct LifeTimeMonitorData*)ILibLinkedList_GetDataFromNode(node)) == NULL || ILibMemory_CanaryOK(Temp)==0)
 		{
-			ILIBLIFETIME_DIAG("TIMER DROPPED: node data %p failed canary/NULL in Check (list %ld)", (void*)Temp, (long)ILibQueue_GetCount(LifeTimeMonitor->ObjectList)); // WikiTech diag
+			{
+				// WikiTech diag v2 (2026-10-21, FERNS-DELL-0066 caught in the act): the node's memory was freed while still
+				// linked. ILibLinkedList_Remove() refuses it (canary) and returns NULL, which ends this walk - every timer
+				// behind it is dead for good, 'timerinfo' prints nothing, the socket and console stay up. Dump where it sits.
+				void *pd, *pr, *pn, *pp; int readable = ILibLinkedList_PeekNode(node, &pd, &pr, &pn, &pp);
+				struct ILibLinkedListNode_Root *root = (struct ILibLinkedListNode_Root*)LifeTimeMonitor->ObjectList;
+				long idx = 0; void *w = root->Head; while (w != NULL && w != node && idx < 100000) { void *d2, *r2, *n2, *p2; if (!ILibLinkedList_PeekNode(w, &d2, &r2, &n2, &p2)) { break; } w = n2; ++idx; }
+				++ILibLifeTime_CorruptHits;
+				ILIBLIFETIME_DIAG("TIMER DROPPED #%d: node %p at index %ld of %ld (head %p tail %p) data %p readable=%d raw[data %p root %p (list root %p) next %p prev %p]; cur tick %lld",
+					ILibLifeTime_CorruptHits, node, idx, (long)root->count, (void*)root->Head, (void*)root->Tail, (void*)Temp, readable, pd, pr, (void*)root, pn, pp, (long long)CurrentTick);
+				if (ILibLifeTime_CorruptHits >= 2)
+				{
+					// Mitigation: nothing behind this node will ever fire again and the heap is already damaged; a restart now
+					// (SCM recovery / systemd) beats the server watchdog's 20-40 min. Logged, then exit the way a fatal does.
+					ILibLinkedList_UnLock(LifeTimeMonitor->ObjectList);
+					ILIBCRITICALEXITMSG(254, "TIMER LIST CORRUPT (freed node still linked) - restarting the agent");
+				}
+			}
 			node = ILibLinkedList_Remove(node);
 			continue;
 		}
@@ -8398,7 +8437,14 @@ void* ILibLinkedList_InsertAfter(void *LinkedList_Node, void *data)
 */
 void* ILibLinkedList_Remove(void *LinkedList_Node)
 {
-	if (!ILibMemory_CanaryOK(LinkedList_Node)) { return(NULL); }
+	if (!ILibMemory_CanaryOK(LinkedList_Node))
+	{
+		// WikiTech diag v2: a caller is removing a node that is already freed. This is the stale link the timer death is made
+		// of; the caller's identity is in the surrounding diag lines (Check / LifeTime_Remove / DeQueue).
+		void *pd, *pr, *pn, *pp; int readable = ILibLinkedList_PeekNode(LinkedList_Node, &pd, &pr, &pn, &pp);
+		ILIBLIFETIME_DIAG("LIST REMOVE of dead node %p (readable=%d raw[data %p root %p next %p prev %p]) - NOT unlinked", LinkedList_Node, readable, pd, pr, pn, pp);
+		return(NULL);
+	}
 	struct ILibLinkedListNode_Root *r;
 	struct ILibLinkedListNode *n;
 	void* RetVal;
@@ -8406,6 +8452,14 @@ void* ILibLinkedList_Remove(void *LinkedList_Node)
 	if (LinkedList_Node == NULL) { return(NULL); }
 	r = ((struct ILibLinkedListNode*)LinkedList_Node)->Root;
 	n = (struct ILibLinkedListNode*) LinkedList_Node;
+
+	// WikiTech diag v2: neighbours and root must agree with this node before we cut it out; if they do not, the list was
+	// already corrupted by someone else and this removal will leave a dangling pointer behind.
+	if (((n->Previous != NULL) && (n->Previous->Next != n)) || ((n->Next != NULL) && (n->Next->Previous != n)) || ((n->Previous == NULL) && (r != NULL) && (r->Head != n)) || ((n->Next == NULL) && (r != NULL) && (r->Tail != n)))
+	{
+		ILIBLIFETIME_DIAG("LIST LINK BROKEN at node %p (root %p count %ld head %p tail %p): prev %p prev->next %p next %p next->prev %p", (void*)n, (void*)r, (r != NULL) ? r->count : -1L, (r != NULL) ? (void*)r->Head : NULL, (r != NULL) ? (void*)r->Tail : NULL,
+			(void*)n->Previous, (n->Previous != NULL) ? (void*)n->Previous->Next : NULL, (void*)n->Next, (n->Next != NULL) ? (void*)n->Next->Previous : NULL);
+	}
 
 	RetVal = n->Next;
 
