@@ -335,7 +335,14 @@ long ILibGetTimeStamp();
 	static inline void ILibSpinLock_Lock(ILibSpinLock *lock)
 	{
 #ifdef WIN32
-		while (!InterlockedCompareExchange(lock, 1, 0))
+		// WikiTech fix (2026-10-22): InterlockedCompareExchange returns the PREVIOUS value (0 = we just took the lock,
+		// 1 = another thread holds it), unlike __sync_bool_compare_and_swap below, which returns whether the swap happened.
+		// With the original "while (!InterlockedCompareExchange(...))" the Windows agent spun once after acquiring and
+		// returned IMMEDIATELY when the lock was held by someone else - i.e. no mutual exclusion at all, since 2020-11-26
+		// (upstream 7783433). Every ILibLinkedList / ILibLifeTime / socket list was unprotected: a worker thread arming a
+		// timer (ILibChain_RunOnMicrostackThread, process pipes, dispatchers) raced the chain thread's timer sweep and left
+		// freed nodes linked in the lifetime list = the fleet's "silent agent / timers dead" fault (FERNS-DELL-0066 dumps).
+		while (InterlockedCompareExchange(lock, 1, 0) != 0)
 		{
 			YieldProcessor();
 		}
